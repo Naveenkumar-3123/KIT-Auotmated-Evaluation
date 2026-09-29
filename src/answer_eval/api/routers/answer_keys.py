@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import logging
@@ -22,6 +23,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["answer-keys"])
 
 MAX_KEY_BYTES = 50 * 1024 * 1024
+
+# Wi-Fi/LAN blips kill idle DB connections mid-operation (real failure:
+# ConnectionDoesNotExistError after a 7-minute parse, losing every completed
+# batch). A parse costs minutes of GPU time, so the final writes tolerate
+# transient network failures with growing backoff (~2.5 min total coverage).
+DB_WRITE_ATTEMPTS = 8
+
+
+async def _retry_db_write(op, *, what: str):
+    delay = 3.0
+    for attempt in range(1, DB_WRITE_ATTEMPTS + 1):
+        try:
+            return await op()
+        except Exception as exc:
+            if attempt == DB_WRITE_ATTEMPTS:
+                raise
+            logger.warning(
+                "Transient DB failure during %s (attempt %s/%s): %s — retrying in %.0fs",
+                what,
+                attempt,
+                DB_WRITE_ATTEMPTS,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.8, 45.0)
 
 
 async def _parser(request: Request):
@@ -46,6 +73,12 @@ async def _parse_job(
     """Runs on the event loop via BackgroundTasks; status lands in the DB."""
     database = require_database(request)
     storage = request.app.state.storage
+    progress_state: dict = getattr(request.app.state, "answer_key_progress", None) or {}
+    request.app.state.answer_key_progress = progress_state
+
+    def on_progress(done: int, total: int) -> None:
+        progress_state[key_id] = {"done": done, "total": total}
+
     try:
         document = convert_source(f"key.{source_format}", source_bytes)
 
@@ -71,27 +104,47 @@ async def _parse_job(
             )
 
         agent = await _parser(request)
-        parsed = await agent.parse(document)
-        await ak_repo.save_parsed(
-            database.pool,
-            key_id=key_id,
-            parsed=parsed,
-            parser_model=getattr(agent, "last_model_id", None),
-            prompt_version=getattr(agent, "prompt_version", "unknown"),
-            diagrams=stored_crops,
+        # Live agents accept on_progress; the fake/test agent may not — keep both paths working.
+        parse_kwargs: dict = {}
+        try:
+            if "on_progress" in inspect.signature(agent.parse).parameters:
+                parse_kwargs["on_progress"] = on_progress
+        except (TypeError, ValueError):
+            pass
+        parsed = await agent.parse(document, **parse_kwargs)
+        # Minutes of GPU work are behind this write — tolerate network blips.
+        await _retry_db_write(
+            lambda: ak_repo.save_parsed(
+                database.pool,
+                key_id=key_id,
+                parsed=parsed,
+                parser_model=getattr(agent, "last_model_id", None),
+                prompt_version=getattr(agent, "prompt_version", "unknown"),
+                diagrams=stored_crops,
+            ),
+            what="save_parsed",
         )
     except (UnsupportedAnswerKeyError, ValueError) as exc:
         logger.warning("Answer-key parse failed for %s: %s", key_id, exc)
-        await ak_repo.set_status(database.pool, key_id, "failed", error=str(exc)[:500])
+        message = str(exc)[:500]
+        await _retry_db_write(
+            lambda: ak_repo.set_status(database.pool, key_id, "failed", error=message),
+            what="set_status(failed)",
+        )
     except Exception as exc:  # noqa: BLE001 - background task must never crash silently
         logger.exception("Unexpected answer-key parse failure for %s", key_id)
         detail = f"{type(exc).__name__}: {exc}"
-        await ak_repo.set_status(
-            database.pool,
-            key_id,
-            "failed",
-            error=f"Parser crashed ({detail[:180]})",
+        await _retry_db_write(
+            lambda: ak_repo.set_status(
+                database.pool,
+                key_id,
+                "failed",
+                error=f"Parser crashed ({detail[:180]})",
+            ),
+            what="set_status(crashed)",
         )
+    finally:
+        progress_state.pop(key_id, None)
 
 
 @router.post("/assessments/{assessment_id}/answer-key", status_code=status.HTTP_202_ACCEPTED)
@@ -127,14 +180,17 @@ async def upload_answer_key(
         data,
     )
     version = await ak_repo.next_version(database.pool, assessment_id)
-    record = await ak_repo.create(
-        database.pool,
-        assessment_id=assessment_id,
-        version=version,
-        source_object_key=object_key,
-        source_format=source_format,
-        source_sha256=sha256,
-        created_by=teacher.profile_id,
+    record = await _retry_db_write(
+        lambda: ak_repo.create(
+            database.pool,
+            assessment_id=assessment_id,
+            version=version,
+            source_object_key=object_key,
+            source_format=source_format,
+            source_sha256=sha256,
+            created_by=teacher.profile_id,
+        ),
+        what="create answer-key row",
     )
     background.add_task(_parse_job, request, record["id"], source_format, data)
     return {"answer_key": record}
@@ -143,6 +199,17 @@ async def upload_answer_key(
 def safe_filename(filename: str) -> str:
     keep = "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in filename)
     return keep[:80]
+
+
+def _with_progress(request: Request, meta: dict) -> dict:
+    """Attach live batch progress while a big key is still parsing."""
+    if meta.get("status") != "parsing":
+        return meta
+    progress_state: dict = getattr(request.app.state, "answer_key_progress", None) or {}
+    progress = progress_state.get(meta["id"])
+    if progress:
+        return {**meta, "progress": progress}
+    return meta
 
 
 @router.get("/assessments/{assessment_id}/answer-key")
@@ -154,6 +221,7 @@ async def get_latest_key(assessment_id: str, request: Request, teacher: CurrentT
     meta = await ak_repo.get_for_assessment(database.pool, assessment_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="No answer key uploaded yet")
+    meta = _with_progress(request, meta)
     questions = await ak_repo.get_questions(database.pool, meta["id"])
     return {"answer_key": meta, "questions": questions}
 
@@ -167,6 +235,7 @@ async def get_key(key_id: str, request: Request, teacher: CurrentTeacher) -> dic
     await assessments_repo.require_owned(
         database.pool, assessment_id=meta["assessment_id"], teacher_id=teacher.profile_id
     )
+    meta = _with_progress(request, meta)
     questions = await ak_repo.get_questions(database.pool, key_id)
     return {"answer_key": meta, "questions": questions}
 

@@ -221,8 +221,12 @@ class QuestionSegmenter:
         vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(25, h // 40)))
         vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, vertical_kernel)
         cleaned = cv2.subtract(cleaned, vertical)
-        speckle_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, speckle_kernel)
+        # Speckle removal via component area: a morphological opening would also
+        # erase genuinely thin (1px) pen strokes, which must survive.
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned)
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] < 4:
+                cleaned[labels == label] = 0
 
         # Horizontal projection: fraction of ink pixels per row
         row_sums = np.sum(cleaned == 255, axis=1) / float(w)

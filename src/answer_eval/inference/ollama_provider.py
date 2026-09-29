@@ -40,6 +40,49 @@ from answer_eval.runtime.profiles import RuntimeConfig
 logger = get_logger("inference.ollama")
 
 
+def _repair_json_invalid_escapes(text: str) -> str:
+    """
+    Fix invalid backslash escapes inside JSON string literals.
+
+    Small models frequently emit hand-written escapes like ``\\d`` (regex),
+    ``\\c`` (fractions) or ``\\0`` inside answers. ``json.loads`` rejects those
+    with ``Invalid \\\\escape`` and a repair re-inference is wasted GPU time
+    (often reproducing the same output verbatim at temperature 0). Instead,
+    rewrite any ``\\x`` where x is not a valid JSON escape char into ``\\\\x``.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        # inside a string literal
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt and nxt not in '"\\/bfnrtu':
+                out.append("\\\\")  # escape the stray backslash
+                i += 1
+                continue
+            out.append(ch)
+            if nxt:
+                out.append(nxt)
+                i += 2
+            else:
+                i += 1
+            continue
+        if ch == '"':
+            in_string = False
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _get_current_memory() -> MemorySnapshot:
     """Collect current VRAM and RAM snapshot."""
     import psutil
@@ -129,6 +172,10 @@ class OllamaProvider(InferenceProvider):
             os.getenv("OLLAMA_TIMEOUT", str(timeout_seconds or settings.ollama.timeout_seconds))
         )
         self.max_retries = int(os.getenv("OLLAMA_MAX_RETRIES", str(max_retries or settings.ollama.max_retries)))
+        # How long Ollama keeps the model in VRAM between calls. The default
+        # (5m) unloads the 3GB+ vision model during short idle gaps and every
+        # reload costs 15-20s of wall time mid-parse.
+        self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
         self.model_profile: ModelProfile | None = None
         self.runtime_config: RuntimeConfig | None = None
@@ -468,6 +515,42 @@ class OllamaProvider(InferenceProvider):
             raise last_err
         raise InferenceError("Ollama inference failed after maximum retries.")
 
+    def _salvage_structured(self, cleaned: str, schema: type | dict[str, Any]):
+        """Recover structured data from a failed response without re-inferring.
+
+        Scans every top-level ``{...}`` object in the raw text and returns the
+        first one that validates against *schema*. This transparently fixes the
+        two common small-model failure shapes:
+          - schema echo: the model emits the JSON-schema JSON, then the answer
+          - "Extra data": multiple concatenated JSON objects
+        Returns None when nothing validates (caller falls back to repair).
+        """
+        if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+            return None
+        decoder = json.JSONDecoder()
+        text = cleaned.strip()
+        index = 0
+        while 0 <= index < len(text):
+            brace = text.find("{", index)
+            if brace == -1:
+                return None
+            try:
+                obj, end = decoder.raw_decode(text[brace:])
+            except json.JSONDecodeError:
+                index = brace + 1
+                continue
+            index = brace + max(end, 1)
+            if not isinstance(obj, dict):
+                continue
+            # Skip obvious schema echoes (the model repeating the schema JSON).
+            if "$defs" in obj or ("properties" in obj and "questions" not in obj):
+                continue
+            try:
+                return schema.model_validate(obj).model_dump()
+            except ValidationError:
+                continue
+        return None
+
     async def infer_structured(
         self,
         request: InferenceRequest,
@@ -533,7 +616,18 @@ class OllamaProvider(InferenceProvider):
             cleaned = self._extract_json_from_response(raw)
 
             try:
-                data = json.loads(cleaned)
+                try:
+                    data = json.loads(cleaned)
+                except json.JSONDecodeError as escape_err:
+                    if "Invalid" in str(escape_err) and "escape" in str(escape_err):
+                        repaired = _repair_json_invalid_escapes(cleaned)
+                        data = json.loads(repaired)
+                        logger.info(
+                            "Structured JSON invalid-escape repaired locally",
+                            request_id=request.request_id,
+                        )
+                    else:
+                        raise
                 if isinstance(schema, type) and issubclass(schema, BaseModel):
                     validated = schema.model_validate(data)
                     resp.structured_data = validated.model_dump()
@@ -541,6 +635,19 @@ class OllamaProvider(InferenceProvider):
                     resp.structured_data = data
                 return resp
             except (json.JSONDecodeError, ValidationError) as e:
+                # Cheap local recovery first: small models commonly emit the
+                # JSON *schema* itself followed by the real object, or several
+                # concatenated objects ("Extra data"). A repair retry costs a
+                # full extra inference (40-130s); scanning the objects we
+                # already have costs milliseconds.
+                salvaged = self._salvage_structured(cleaned, schema)
+                if salvaged is not None:
+                    logger.info(
+                        "Structured JSON salvaged without repair retry",
+                        request_id=request.request_id,
+                    )
+                    resp.structured_data = salvaged
+                    return resp
                 last_error_text = str(e)
                 logger.warning(
                     "Structured JSON validation failed",
@@ -557,6 +664,10 @@ class OllamaProvider(InferenceProvider):
                 "last_error": last_error_text,
                 "raw_response_length": len(last_raw),
                 "raw_response_preview": last_raw[:300],
+                # Full text so callers with domain-specific salvage logic
+                # (e.g. the answer-key parser's truncated-JSON recovery) can
+                # still extract value without another inference round-trip.
+                "raw_response": last_raw,
             },
         )
 
@@ -625,6 +736,7 @@ class OllamaProvider(InferenceProvider):
             "messages": messages,
             "think": False,
             "stream": False,
+            "keep_alive": self.keep_alive,
             "options": {
                 "num_ctx": self._ocr_cfg.num_ctx,
                 "num_predict": request.max_tokens or self._ocr_cfg.num_predict,

@@ -185,7 +185,7 @@ def test_regions_never_overlap_adjacent_bands(temp_workspace: Path) -> None:
     draw = ImageDraw.Draw(img)
     # Four content clusters: two tight multi-line groups with small gaps.
     bands = [(300, 420), (470, 590), (900, 1010), (1090, 1300)]
-    for group_idx, (y0, y1) in enumerate(bands, start=1):
+    for _group_idx, (y0, y1) in enumerate(bands, start=1):
         y = y0
         while y <= y1:
             draw.line([(150, y), (650, y)], fill=(10, 10, 10), width=8)
@@ -203,3 +203,56 @@ def test_regions_never_overlap_adjacent_bands(temp_workspace: Path) -> None:
             f"{nxt.region_id} ({nxt.bbox.y_min:.3f}-{nxt.bbox.y_max:.3f})"
         )
         assert nxt.bbox.y_max > nxt.bbox.y_min  # never a degenerate/inverted band
+
+
+def test_page_borders_do_not_fuse_answers_into_one_region(temp_workspace: Path) -> None:
+    """Regression: scanned page borders / margin rules put ink on EVERY row.
+
+    The horizontal-projection split previously treated those rows as active
+    ink, fusing the entire page into ONE region (real failure: 6 answers on a
+    scanned page collapsed into a single full-page region, so half the
+    questions were never graded). Borders and long vertical structures must be
+    stripped before the row profile.
+    """
+    img = Image.new("RGB", (1000, 2000), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    # Full-height vertical page borders (like a scanned sheet edge).
+    draw.rectangle([4, 0, 10, 1999], fill=(40, 40, 40))
+    draw.rectangle([988, 0, 994, 1999], fill=(40, 40, 40))
+    # Two answer blocks separated by a wide whitespace gap.
+    for y in range(200, 700, 40):
+        draw.text((80, y), f"answer block one line at y={y}", fill=(20, 20, 20))
+    for y in range(1200, 1700, 40):
+        draw.text((80, y), f"answer block two line at y={y}", fill=(20, 20, 20))
+
+    prep_page = _prep_page_from_image(img, temp_workspace)
+    segmenter = QuestionSegmenter(crops_output_dir=temp_workspace / "crops")
+
+    # Debug: inspect the cleaned row profile inside the whitespace gap.
+    import cv2
+    import numpy as np
+
+    gray = np.array(img.convert("L"))
+    h, w = gray.shape[:2]
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    border_free = int(w * 0.02)
+    cleaned = thresh.copy()
+    cleaned[:, :border_free] = 0
+    cleaned[:, w - border_free:] = 0
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(25, h // 40)))
+    vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, vertical_kernel)
+    cleaned = cv2.subtract(cleaned, vertical)
+    speckle_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, speckle_kernel)
+    row_sums = np.sum(cleaned == 255, axis=1) / float(w)
+    gap = row_sums[750:1150]
+    print(f"gap row_sums max={gap.max():.5f} mean={gap.mean():.5f} threshold=0.0015")
+    ys = np.where(row_sums > 0.0015)[0]
+    print(f"active rows: {len(ys)} first={ys[:3]} last={ys[-3:] if len(ys) else []}")
+
+    result = segmenter.segment_page(prep_page)
+
+    assert len(result.regions) >= 2, (
+        f"page borders fused the answer blocks: got {len(result.regions)} region(s)"
+    )
+

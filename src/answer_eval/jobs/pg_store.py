@@ -75,6 +75,20 @@ class PostgresJobStore:
             self._pool = None
         self._loop.call_soon_threadsafe(self._loop.stop)
 
+    @property
+    def pool(self) -> asyncpg.Pool | None:
+        """Expose the pool so components (e.g. evidence persistence) can reuse it."""
+        return self._pool
+
+    def run_coro(self, coro):
+        """Run an awaitable to completion on the store's event loop (thread-safe).
+
+        Reused by evidence persistence so asyncpg operations stay on the same
+        loop the pool was created on (``asyncio.run`` on the caller's thread
+        would bind the pool's connections to a different loop and fail).
+        """
+        return self._run(coro)
+
     @staticmethod
     def _record_from(row: asyncpg.Record | None) -> JobRecord | None:
         if row is None:

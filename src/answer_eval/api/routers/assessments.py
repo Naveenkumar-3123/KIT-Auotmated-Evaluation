@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from answer_eval.api.deps import CurrentTeacher, require_database
@@ -217,42 +217,71 @@ async def begin_evaluation(
     storage_root = getattr(storage, "_root", None)
 
     jobs_created = 0
-    if job_service is not None and storage_root is not None:
-        resolved = await policies_repo.get_resolved(database.pool, assessment_id=assessment_id)
-        rubrics, teacher_rules = build_workflow_inputs(resolved)
+    try:
+        if job_service is not None and storage_root is not None:
+            resolved = await policies_repo.get_resolved(database.pool, assessment_id=assessment_id)
+            rubrics, teacher_rules = build_workflow_inputs(resolved)
 
-        roster = await submissions_repo.list_for_assessment(database.pool, assessment_id)
-        for item in roster:
-            if item["status"] != "queued":
-                continue
-            object_key = item.get("pdf_object_key")
-            if not object_key:
-                logger.warning("Skipping submission without a stored PDF", submission_id=item["id"])
-                continue
-            pdf_path = str(Path(storage_root) / object_key)
-            if not Path(pdf_path).is_file():
-                # Never enqueue a job that cannot possibly run: the durable
-                # store is shared across machines, and a job whose file is
-                # missing HERE would be claimed and failed elsewhere.
-                logger.warning(
-                    "Skipping submission whose stored PDF is missing on this node",
+            roster = await submissions_repo.list_for_assessment(database.pool, assessment_id)
+            for item in roster:
+                if item["status"] != "queued":
+                    continue
+                object_key = item.get("pdf_object_key")
+                if not object_key:
+                    logger.warning("Skipping submission without a stored PDF", submission_id=item["id"])
+                    continue
+                pdf_path = str(Path(storage_root) / object_key)
+                if not Path(pdf_path).is_file():
+                    # Never enqueue a job that cannot possibly run: the durable
+                    # store is shared across machines, and a job whose file is
+                    # missing HERE would be claimed and failed elsewhere.
+                    logger.warning(
+                        "Skipping submission whose stored PDF is missing on this node",
+                        submission_id=item["id"],
+                        pdf_path=pdf_path,
+                    )
+                    continue
+                job_service.submit(
                     submission_id=item["id"],
                     pdf_path=pdf_path,
+                    rubrics=rubrics,
+                    teacher_rules=teacher_rules,
                 )
-                continue
-            job_service.submit(
-                submission_id=item["id"],
-                pdf_path=pdf_path,
-                rubrics=rubrics,
-                teacher_rules=teacher_rules,
+                jobs_created += 1
+        elif getattr(request.app.state, "database", None) is not None:
+            raise HTTPException(
+                status_code=503,
+                detail="Worker job store unavailable: the single-node bridge needs local file storage "
+                "(configure STORAGE_LOCAL_ROOT and restart the API).",
             )
-            jobs_created += 1
-    elif getattr(request.app.state, "database", None) is not None:
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # A transient DB/network failure here used to strand the assessment in
+        # "processing" with no job (every retry then hit 409 "already running").
+        # Roll the optimistic status flip back so the teacher can just retry.
+        logger.exception("Failed to enqueue evaluation jobs for %s — reverting status", assessment_id)
+        try:
+            await assessments_repo.set_status(
+                database.pool,
+                assessment_id=assessment_id,
+                teacher_id=teacher.profile_id,
+                new_status="configured",
+                allowed_from=("processing",),
+            )
+            await database.pool.execute(
+                """update submissions
+                      set status = 'uploaded', updated_at = now()
+                    where assessment_id = $1::uuid and status = 'queued'""",
+                assessment_id,
+            )
+        except Exception:  # noqa: BLE001 - rollback is best-effort
+            logger.exception("Failed to revert assessment %s after enqueue failure", assessment_id)
         raise HTTPException(
             status_code=503,
-            detail="Worker job store unavailable: the single-node bridge needs local file storage "
-            "(configure STORAGE_LOCAL_ROOT and restart the API).",
-        )
+            detail=f"Could not start evaluation (connection hiccup): {exc}. "
+            "Nothing was lost — everything was rolled back, please try again.",
+        ) from exc
 
     return {
         "assessment_id": assessment_id,
@@ -491,4 +520,260 @@ async def download_submission_pdf(
 
     return StreamingResponse(iterator(), media_type="application/pdf", headers={
         "Content-Disposition": f'inline; filename="{submission["roll_number"]}.pdf"'
+    })
+
+
+# ---------------------------------------------------------------------------
+# Processing-pipeline evidence (Results → "View Processing Details")
+# ---------------------------------------------------------------------------
+
+# Local artifact folders written by the perception pipeline (rendered page
+# PNGs, preprocessed page PNGs, per-region crops). Filenames are prefixed with
+# the submission id, so they are safe to expose per-submission.
+_PROCESSING_IMAGE_DIRS: dict[str, Path] = {
+    "original": Path("data") / "rendered_pages",
+    "preprocessed": Path("data") / "preprocessed_pages",
+    "segments": Path("data") / "region_crops",
+}
+
+
+def _as_dict(value: object) -> dict:
+    if isinstance(value, str):
+        import json as _json
+
+        try:
+            value = _json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+@router.get("/submissions/{submission_id}/processing")
+async def get_submission_processing(
+    submission_id: str,
+    request: Request,
+    teacher: CurrentTeacher,
+) -> dict:
+    """Pipeline evidence for one submission: job status, per-question grading
+    data (proposed marks, feedback, risk signals) and processing artifact
+    images (rendered pages, preprocessed pages, region crops)."""
+    database = require_database(request)
+    submission = await submissions_repo.get_submission(database.pool, submission_id)
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    try:
+        await assessments_repo.require_owned(
+            database.pool,
+            assessment_id=str(submission["assessment_id"]),
+            teacher_id=teacher.profile_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Submission not found") from exc
+
+    job_payload: dict = {}
+    job_row = await database.pool.fetchrow(
+        "select payload from job_records where submission_id = $1"
+        " order by created_at desc limit 1",
+        submission_id,
+    )
+    if job_row is not None:
+        job_payload = _as_dict(job_row["payload"])
+
+    job: dict | None = None
+    if job_payload:
+        job = {
+            "job_id": job_payload.get("job_id"),
+            "status": job_payload.get("status"),
+            "current_stage": job_payload.get("current_stage"),
+            "attempt": job_payload.get("attempt"),
+            "progress_completed": job_payload.get("progress_completed"),
+            "progress_total": job_payload.get("progress_total"),
+            "worker_id": job_payload.get("worker_id"),
+            "created_at": job_payload.get("created_at"),
+            "started_at": job_payload.get("started_at"),
+            "completed_at": job_payload.get("completed_at"),
+            "error": job_payload.get("error"),
+        }
+
+    # Per-question grading evidence: AI proposal, feedback and risk signals
+    # from the review request (waiting_for_review) or the teacher decisions.
+    questions: dict[str, dict] = {}
+    review_request = _as_dict(job_payload.get("review_request"))
+    awaiting = _as_dict(review_request.get("awaiting_review"))
+    for qid, raw in awaiting.items():
+        entry = _as_dict(raw)
+        risk = _as_dict(entry.get("risk"))
+        comparison = _as_dict(entry.get("comparison"))
+        questions[str(qid)] = {
+            "question_id": entry.get("question_id", qid),
+            "proposed_marks": entry.get("proposed_marks"),
+            "maximum_marks": entry.get("maximum_marks"),
+            "feedback": entry.get("feedback"),
+            "reasons": entry.get("reasons") or risk.get("review_reasons") or [],
+            "risk_level": risk.get("risk_level"),
+            "risk_score": risk.get("risk_score"),
+            "auto_approve": risk.get("auto_approve"),
+            "review_reasons": risk.get("review_reasons") or [],
+            "grader_disagreement": _as_dict(risk.get("signals")).get("grader_disagreement"),
+            "ocr_uncertainty": _as_dict(risk.get("signals")).get("ocr_uncertainty"),
+            "major_disagreement": comparison.get("major_disagreement"),
+        }
+    for qid, raw in _as_dict(job_payload.get("review_decisions")).items():
+        entry = _as_dict(raw)
+        questions.setdefault(
+            str(qid), {"question_id": qid, "proposed_marks": None, "maximum_marks": None}
+        )
+        questions[str(qid)]["teacher_decision"] = {
+            "approved": entry.get("approved"),
+            "final_marks": entry.get("final_marks"),
+            "reviewer_notes": entry.get("reviewer_notes"),
+        }
+
+    artifacts: dict[str, list[str]] = {}
+    prefix = f"{submission_id}_"
+    for kind, directory in _PROCESSING_IMAGE_DIRS.items():
+        artifacts[kind] = (
+            sorted(p.name for p in directory.glob(f"{prefix}*.png"))
+            if directory.is_dir()
+            else []
+        )
+
+    # DB-backed perception evidence (written by the worker on job completion;
+    # empty for evaluations that finished before evidence persistence existed).
+    import uuid as _uuid
+
+    pages_out: list[dict] = []
+    regions_out: list[dict] = []
+    spans_out: list[dict] = []
+    try:
+        page_rows = await database.pool.fetch(
+            """
+            select page_number, width_px, height_px, quality_metrics
+            from submission_pages where submission_id = $1::uuid order by page_number
+            """,
+            _uuid.UUID(submission_id),
+        )
+        for row in page_rows:
+            metrics = row["quality_metrics"] or {}
+            pages_out.append(
+                {
+                    "page_number": row["page_number"],
+                    "width_px": row["width_px"],
+                    "height_px": row["height_px"],
+                    "quality_flags": metrics.get("quality_flags", [])
+                    if isinstance(metrics, dict)
+                    else [],
+                }
+            )
+        region_rows = await database.pool.fetch(
+            """
+            select r.id::text, r.page_number, r.bbox, r.region_type,
+                   r.reading_order, r.confidence, s.question_id as span_question,
+                   o.raw_text, o.lines, o.uncertain_spans, o.flags,
+                   o.word_count, o.status as ocr_status, o.model_id
+            from question_regions r
+            left join question_spans s on s.id = r.span_id
+            left join ocr_results o on o.region_id = r.id
+            where r.submission_id = $1::uuid
+            order by r.page_number, r.reading_order
+            """,
+            _uuid.UUID(submission_id),
+        )
+        for row in region_rows:
+            ocr = None
+            if row["raw_text"] is not None:
+                ocr = {
+                    "raw_text": row["raw_text"],
+                    "lines": row["lines"] or [],
+                    "uncertain_spans": row["uncertain_spans"] or [],
+                    "flags": row["flags"] or [],
+                    "word_count": row["word_count"],
+                    "status": row["ocr_status"],
+                    "model_id": row["model_id"],
+                }
+            regions_out.append(
+                {
+                    "region_id": row["id"],
+                    "page_number": row["page_number"],
+                    "question_id": row["span_question"],
+                    "bbox": row["bbox"] or {},
+                    "region_type": row["region_type"],
+                    "reading_order": row["reading_order"],
+                    "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+                    "ocr": ocr,
+                }
+            )
+        span_rows = await database.pool.fetch(
+            """
+            select question_id, start_page, end_page, region_ids,
+                   mapping_uncertain, uncertainty_reasons
+            from question_spans where submission_id = $1::uuid order by question_id
+            """,
+            _uuid.UUID(submission_id),
+        )
+        spans_out = [
+            {
+                "question_id": row["question_id"],
+                "start_page": row["start_page"],
+                "end_page": row["end_page"],
+                "region_ids": row["region_ids"] or [],
+                "mapping_uncertain": row["mapping_uncertain"],
+                "uncertainty_reasons": row["uncertainty_reasons"] or [],
+            }
+            for row in span_rows
+        ]
+    except Exception:  # noqa: BLE001 - evidence endpoint must not crash on schema drift
+        pass
+
+    return {
+        "submission_id": submission_id,
+        "roll_number": submission["roll_number"],
+        "status": submission["status"],
+        "page_count": submission.get("page_count"),
+        "job": job,
+        "questions": questions,
+        "artifacts": artifacts,
+        "pages": pages_out,
+        "regions": regions_out,
+        "spans": spans_out,
+    }
+
+
+@router.get("/submissions/{submission_id}/processing/images/{kind}/{filename}")
+async def get_processing_image(
+    submission_id: str,
+    kind: str,
+    filename: str,
+    request: Request,
+    teacher: CurrentTeacher,
+) -> FileResponse:
+    """Streams one processing artifact image (PNG) after ownership checks."""
+    if kind not in _PROCESSING_IMAGE_DIRS:
+        raise HTTPException(status_code=404, detail="Unknown artifact kind")
+    if (
+        "/" in filename
+        or "\\" in filename
+        or ".." in filename
+        or not filename.startswith(f"{submission_id}_")
+        or not filename.endswith(".png")
+    ):
+        raise HTTPException(status_code=404, detail="Invalid artifact name")
+    database = require_database(request)
+    submission = await submissions_repo.get_submission(database.pool, submission_id)
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    try:
+        await assessments_repo.require_owned(
+            database.pool,
+            assessment_id=str(submission["assessment_id"]),
+            teacher_id=teacher.profile_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Submission not found") from exc
+
+    path = _PROCESSING_IMAGE_DIRS[kind] / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return FileResponse(path, media_type="image/png", headers={
+        "Cache-Control": "private, max-age=3600",
     })

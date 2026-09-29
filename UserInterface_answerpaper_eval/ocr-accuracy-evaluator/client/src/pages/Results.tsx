@@ -5,6 +5,8 @@ import { toast } from "sonner";
 import { apiFetchObjectUrl } from "@/api/client";
 import { listAssessments } from "@/api/assessments";
 import { getAssessmentResults, getSubmissionResult, getSubmissionReviewRequest, submitReviewDecisions, type AssessmentResults, type ReviewDecision, type ReviewPendingQuestion, type SubmissionResultDetail } from "@/api/results";
+import { getResolvedPolicies } from "@/api/policies";
+import { fetchProcessingImageUrl, getProcessingDetails, type ProcessingDetails, type ProcessingImageKind, type ProcessingQuestion, type ProcessingRegion } from "@/api/processing";
 import { AlertTriangle, ArrowLeft, ArrowRight, Award, BarChart3, BookOpenCheck, Braces, CheckCircle2, ChevronRight, Download, FileText, Filter, Layers3, Pencil, ScanLine, Search, UsersRound, X } from "lucide-react";
 import { PreviewModal } from "@/components/evaluation/PreviewModal";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -111,6 +113,25 @@ function StudentResults({ resultClass, student, onBack, onReviewResolved }: { re
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
   const [pendingReview, setPendingReview] = useState<Record<string, ReviewPendingQuestion> | null>(null);
+  const [strictnessByQ, setStrictnessByQ] = useState<Record<number, QuestionResult["strictness"]>>({});
+  // Resolved policies drive the strictness pill for AI-proposed (pending) questions,
+  // which have no read-model row yet.
+  useEffect(() => {
+    let cancelled = false;
+    getResolvedPolicies(resultClass.id)
+      .then((payload) => {
+        if (cancelled) return;
+        const map: Record<number, QuestionResult["strictness"]> = {};
+        for (const p of payload.policies ?? []) {
+          map[p.question_number] = normalizeStrictness(p.strictness_level);
+        }
+        setStrictnessByQ(map);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [resultClass.id]);
   const loadAnswerSheet = () => {
     if (pdfUrl || pdfLoading) return;
     setPdfLoading(true);
@@ -143,7 +164,7 @@ function StudentResults({ resultClass, student, onBack, onReviewResolved }: { re
           questionText: "Awaiting your approval — AI-proposed marks.",
           marksAwarded: Number(q.proposed_marks) || 0,
           maxMarks: Number(q.maximum_marks) || 0,
-          strictness: "moderate",
+          strictness: strictnessByQ[num] ?? "moderate",
           studentAnswer: "",
           expectedPoints: [],
           evaluation: q.feedback || (q.reasons ?? []).join(" · "),
@@ -152,10 +173,10 @@ function StudentResults({ resultClass, student, onBack, onReviewResolved }: { re
       }
     }
     return rows.sort((a, b) => a.number - b.number);
-  }, [student.questionResults, student.id, pendingByQid]);
+  }, [student.questionResults, student.id, pendingByQid, strictnessByQ]);
   const displayTotal = mergedQuestionResults.reduce((sum, q) => sum + q.marksAwarded, 0);
   const reviewedQuestions = mergedQuestionResults.filter((question) => question.needsReview).length;
-  return <div className="space-y-5"><section className="rounded-[26px] border border-white/85 bg-[linear-gradient(108deg,rgba(255,255,255,0.93),rgba(249,251,255,0.7)_56%,rgba(255,253,241,0.7))] p-6 shadow-[0_18px_42px_rgba(60,70,135,0.09)] sm:p-7"><button type="button" onClick={onBack} className="type-button inline-flex items-center gap-1.5 text-[#6477e4] hover:text-[#4358ca] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#7788ff]"><ArrowLeft className="h-4 w-4" />{resultClass.className} Results</button><div className="mt-5 flex flex-col justify-between gap-5 sm:flex-row sm:items-end"><div><p className="type-overline text-[#7182ef]">Student result</p><h1 className="type-page-title mt-2 text-[#171827] dark:text-white">{student.rollNumber}</h1><p className="mt-1 text-[15px] font-medium text-slate-600 dark:text-slate-300">{resultClass.subject} · {resultClass.className}</p><div className="mt-3"><StatusPill status={student.status} /></div></div><div className="rounded-[20px] border border-[#dce2ff] bg-white/85 px-5 py-4 text-left shadow-sm dark:border-white/10 dark:bg-white/[0.05] sm:text-right"><p className="type-overline text-[#7484e6]">Total score</p><p className="mt-2 text-[31px] font-semibold leading-none tracking-[-0.07em] text-[#171827] dark:text-white">{displayTotal} <span className="text-[17px] tracking-[-0.03em] text-slate-400">/ {student.maxScore}</span></p></div></div></section><section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><MetricCard label={isAwaitingReview ? "AI-proposed total" : "Total score"} value={`${displayTotal} / ${student.maxScore}`} detail={isAwaitingReview ? "Awaiting your review approval" : "Recorded evaluation total"} icon={Award} /><MetricCard label="Questions" value={`${mergedQuestionResults.length} / ${mergedQuestionResults.length}`} detail="Evaluation complete" icon={CheckCircle2} tone="text-[#4f8f70] bg-[#e8f7ef]" /><MetricCard label="Review required" value={String(reviewedQuestions)} detail={reviewedQuestions ? "Check marked question" : "No question flags"} icon={AlertTriangle} tone={reviewedQuestions ? "text-[#b57626] bg-[#fff2df]" : "text-[#4f8f70] bg-[#e8f7ef]"} /><MetricCard label="Evaluation status" value={resultStatusLabel[student.status]} detail="Teacher-facing state" icon={BookOpenCheck} tone="text-[#6a7ee1] bg-[#eef0ff]" /></section>{student.status === "needs-review" && <ReviewPanel assessmentId={resultClass.id} submissionId={student.id} onResolved={onReviewResolved} onPendingChange={setPendingReview} />}<section><div className="mb-4 flex flex-col justify-between gap-3 sm:flex-row sm:items-end"><div><p className="type-overline text-[#7182ef]">Question-level result</p><h2 className="type-section-title mt-1 text-[#171827] dark:text-white">Marks and evaluation explanation</h2></div><p className="type-support text-slate-500 dark:text-slate-400">Select a question to inspect the full answer and marking key.</p></div><div className="space-y-3">{mergedQuestionResults.map((question) => <article key={question.id} className="rounded-[22px] border border-white/85 bg-white/72 p-5 shadow-[0_10px_24px_rgba(60,70,135,0.06)] backdrop-blur-xl dark:border-white/10 dark:bg-white/[0.05]"><div className="flex flex-col justify-between gap-4 sm:flex-row"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><p className="type-overline text-[#7182ef]">Question {question.number}</p><StrictnessPill strictness={question.strictness} />{question.needsReview && <span className="inline-flex rounded-full bg-[#fff2df] px-2.5 py-1 text-[11px] font-semibold text-[#b57626]">Needs Review</span>}</div><h3 className="mt-3 text-[15px] font-semibold tracking-[-0.022em] text-[#171827] dark:text-white">{question.questionText}</h3><p className="mt-2 max-w-[760px] text-[13px] font-medium leading-5 text-slate-600 dark:text-slate-300">{question.evaluation}</p></div><div className="flex shrink-0 items-center justify-between gap-4 sm:flex-col sm:items-end">{(() => { const pendingQ = pendingByQid[String(question.number)]; return pendingQ ? (<><p className="text-[24px] font-semibold leading-none tracking-[-0.06em] text-[#b57626]">{pendingQ.proposed_marks ?? 0} <span className="text-[15px] tracking-[-0.02em] text-slate-400">/ {question.maxMarks}</span></p><span className="rounded-full bg-[#fff2df] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.06em] text-[#b57626]">AI proposed</span></>) : (<p className="text-[24px] font-semibold leading-none tracking-[-0.06em] text-[#171827] dark:text-white">{question.marksAwarded} <span className="text-[15px] tracking-[-0.02em] text-slate-400">/ {question.maxMarks}</span></p>); })()}<button type="button" onClick={() => setSelectedQuestion(question)} className="type-button inline-flex items-center gap-1 text-[#6477e4] hover:text-[#4358ca] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#7788ff]">View Details <ChevronRight className="h-3.5 w-3.5" /></button></div></div></article>)}</div></section><section className="flex flex-col gap-3 rounded-[22px] border border-white/85 bg-white/65 p-4 shadow-[0_10px_24px_rgba(60,70,135,0.05)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between dark:border-white/10 dark:bg-white/[0.04]"><div><p className="text-[14px] font-semibold text-[#171827] dark:text-white">Document and evidence</p><p className="mt-1 text-[12px] font-medium text-slate-500 dark:text-slate-400">Answer-sheet preview and processing details remain secondary to the marking decision.</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={() => { setShowAnswerSheet(true); loadAnswerSheet(); }} className="type-button inline-flex items-center gap-2 rounded-full border border-[#dce2ff] bg-white/75 px-4 py-2.5 text-[#5366d4] shadow-sm hover:bg-white dark:border-white/10 dark:bg-white/[0.06] dark:text-[#b8c0ff]"><FileText className="h-4 w-4" />View Answer Sheet</button><button type="button" onClick={() => setShowEvidence(true)} className="type-button inline-flex items-center gap-2 rounded-full bg-[#171b32] px-4 py-2.5 text-white shadow-sm hover:bg-[#24294a] dark:bg-[#9aa8ff] dark:text-[#151827]"><Layers3 className="h-4 w-4" />View Processing Details</button></div></section><PreviewModal open={showAnswerSheet} onClose={() => setShowAnswerSheet(false)} title={`${student.rollNumber} answer sheet`} subtitle={pdfError ?? (pdfUrl ? "Original uploaded answer sheet." : pdfLoading ? "Loading answer sheet…" : "No answer-sheet file available.")} fileName={`${student.rollNumber}.pdf`} contentUrl={pdfUrl} /><QuestionDetailDrawer question={selectedQuestion} onClose={() => setSelectedQuestion(null)} /><TechnicalEvidenceDrawer open={showEvidence} student={student} resultClass={resultClass} onClose={() => setShowEvidence(false)} /></div>;
+  return <div className="space-y-5"><section className="rounded-[26px] border border-white/85 bg-[linear-gradient(108deg,rgba(255,255,255,0.93),rgba(249,251,255,0.7)_56%,rgba(255,253,241,0.7))] p-6 shadow-[0_18px_42px_rgba(60,70,135,0.09)] sm:p-7"><button type="button" onClick={onBack} className="type-button inline-flex items-center gap-1.5 text-[#6477e4] hover:text-[#4358ca] focus-visible:outline-2 focus-visible:outline-offset-3 focus-visible:outline-[#7788ff]"><ArrowLeft className="h-4 w-4" />{resultClass.className} Results</button><div className="mt-5 flex flex-col justify-between gap-5 sm:flex-row sm:items-end"><div><p className="type-overline text-[#7182ef]">Student result</p><h1 className="type-page-title mt-2 text-[#171827] dark:text-white">{student.rollNumber}</h1><p className="mt-1 text-[15px] font-medium text-slate-600 dark:text-slate-300">{resultClass.subject} · {resultClass.className}</p><div className="mt-3"><StatusPill status={student.status} /></div></div><div className="rounded-[20px] border border-[#dce2ff] bg-white/85 px-5 py-4 text-left shadow-sm dark:border-white/10 dark:bg-white/[0.05] sm:text-right"><p className="type-overline text-[#7484e6]">Total score</p><p className="mt-2 text-[31px] font-semibold leading-none tracking-[-0.07em] text-[#171827] dark:text-white">{displayTotal} <span className="text-[17px] tracking-[-0.03em] text-slate-400">/ {student.maxScore}</span></p></div></div></section><section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><MetricCard label={isAwaitingReview ? "AI-proposed total" : "Total score"} value={`${displayTotal} / ${student.maxScore}`} detail={isAwaitingReview ? "Awaiting your review approval" : "Recorded evaluation total"} icon={Award} /><MetricCard label="Questions" value={`${mergedQuestionResults.length} / ${mergedQuestionResults.length}`} detail="Evaluation complete" icon={CheckCircle2} tone="text-[#4f8f70] bg-[#e8f7ef]" /><MetricCard label="Review required" value={String(reviewedQuestions)} detail={reviewedQuestions ? "Check marked question" : "No question flags"} icon={AlertTriangle} tone={reviewedQuestions ? "text-[#b57626] bg-[#fff2df]" : "text-[#4f8f70] bg-[#e8f7ef]"} /><MetricCard label="Evaluation status" value={resultStatusLabel[student.status]} detail="Teacher-facing state" icon={BookOpenCheck} tone="text-[#6a7ee1] bg-[#eef0ff]" /></section>{student.status === "needs-review" && <ReviewPanel assessmentId={resultClass.id} submissionId={student.id} onResolved={onReviewResolved} onPendingChange={setPendingReview} />}<section className="flex justify-end"><button type="button" onClick={() => setShowEvidence(true)} className="type-button inline-flex items-center gap-2 rounded-full border border-[#cfd6ff] bg-white px-4 py-2 text-[13px] font-semibold text-[#5366d4] shadow-sm hover:bg-[#fdfdff] dark:border-white/10 dark:bg-white/[0.06] dark:text-[#b8c0ff]"><ScanLine className="h-4 w-4" />View Processing Details</button></section><section><div className="mb-4 flex flex-col justify-between gap-3 sm:flex-row sm:items-end"><div><p className="type-overline text-[#7182ef]">Question-level result</p><h2 className="type-section-title mt-1 text-[#171827] dark:text-white">Marks and evaluation explanation</h2></div><p className="type-support text-slate-500 dark:text-slate-400">Select a question to inspect the full answer and marking key.</p></div><div className="space-y-3">{mergedQuestionResults.map((question) => <article key={question.id} className="rounded-[22px] border border-white/85 bg-white/72 p-5 shadow-[0_10px_24px_rgba(60,70,135,0.06)] backdrop-blur-xl dark:border-white/10 dark:bg-white/[0.05]"><div className="flex flex-col justify-between gap-4 sm:flex-row"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><p className="type-overline text-[#7182ef]">Question {question.number}</p><StrictnessPill strictness={question.strictness} />{question.needsReview && <span className="inline-flex rounded-full bg-[#fff2df] px-2.5 py-1 text-[11px] font-semibold text-[#b57626]">Needs Review</span>}</div><h3 className="mt-3 text-[15px] font-semibold tracking-[-0.022em] text-[#171827] dark:text-white">{question.questionText}</h3><p className="mt-2 max-w-[760px] text-[13px] font-medium leading-5 text-slate-600 dark:text-slate-300">{question.evaluation}</p></div><div className="flex shrink-0 items-center justify-between gap-4 sm:flex-col sm:items-end">{(() => { const pendingQ = pendingByQid[String(question.number)]; return pendingQ ? (<><p className="text-[24px] font-semibold leading-none tracking-[-0.06em] text-[#b57626]">{pendingQ.proposed_marks ?? 0} <span className="text-[15px] tracking-[-0.02em] text-slate-400">/ {question.maxMarks}</span></p><span className="rounded-full bg-[#fff2df] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.06em] text-[#b57626]">AI proposed</span></>) : (<p className="text-[24px] font-semibold leading-none tracking-[-0.06em] text-[#171827] dark:text-white">{question.marksAwarded} <span className="text-[15px] tracking-[-0.02em] text-slate-400">/ {question.maxMarks}</span></p>); })()}<button type="button" onClick={() => setSelectedQuestion(question)} className="type-button inline-flex items-center gap-1 text-[#6477e4] hover:text-[#4358ca] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#7788ff]">View Details <ChevronRight className="h-3.5 w-3.5" /></button></div></div></article>)}</div></section><section className="flex flex-col gap-3 rounded-[22px] border border-white/85 bg-white/65 p-4 shadow-[0_10px_24px_rgba(60,70,135,0.05)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between dark:border-white/10 dark:bg-white/[0.04]"><div><p className="text-[14px] font-semibold text-[#171827] dark:text-white">Document and evidence</p><p className="mt-1 text-[12px] font-medium text-slate-500 dark:text-slate-400">Answer-sheet preview and processing details remain secondary to the marking decision.</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={() => { setShowAnswerSheet(true); loadAnswerSheet(); }} className="type-button inline-flex items-center gap-2 rounded-full border border-[#dce2ff] bg-white/75 px-4 py-2.5 text-[#5366d4] shadow-sm hover:bg-white dark:border-white/10 dark:bg-white/[0.06] dark:text-[#b8c0ff]"><FileText className="h-4 w-4" />View Answer Sheet</button><button type="button" onClick={() => setShowEvidence(true)} className="type-button inline-flex items-center gap-2 rounded-full bg-[#171b32] px-4 py-2.5 text-white shadow-sm hover:bg-[#24294a] dark:bg-[#9aa8ff] dark:text-[#151827]"><Layers3 className="h-4 w-4" />View Processing Details</button></div></section><PreviewModal open={showAnswerSheet} onClose={() => setShowAnswerSheet(false)} title={`${student.rollNumber} answer sheet`} subtitle={pdfError ?? (pdfUrl ? "Original uploaded answer sheet." : pdfLoading ? "Loading answer sheet…" : "No answer-sheet file available.")} fileName={`${student.rollNumber}.pdf`} contentUrl={pdfUrl} /><QuestionDetailDrawer question={selectedQuestion} onClose={() => setSelectedQuestion(null)} /><TechnicalEvidenceDrawer open={showEvidence} student={student} onClose={() => setShowEvidence(false)} /></div>;
 }
 
 function QuestionDetailDrawer({ question, onClose }: { question: QuestionResult | null; onClose: () => void }) {
@@ -169,30 +190,183 @@ function QuestionDetailDrawer({ question, onClose }: { question: QuestionResult 
 
 function DetailSection({ label, body }: { label: string; body: string }) { return <section className="mt-5 rounded-[20px] border border-white/85 bg-white/72 p-5 shadow-[0_10px_24px_rgba(60,70,135,0.06)] dark:border-white/10 dark:bg-white/[0.05]"><p className="type-overline text-[#7484e6]">{label}</p><p className="mt-3 text-[13px] font-medium leading-6 text-slate-600 dark:text-slate-300">{body}</p></section>; }
 
-function TechnicalEvidenceDrawer({ open, student, resultClass, onClose }: { open: boolean; student: StudentResult; resultClass: ResultClass; onClose: () => void }) {
-  const [rawData, setRawData] = useState(false);
-  if (!open) return null;
-  const sampleQuestion = student.questionResults?.[0];
-  if (!sampleQuestion) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <button type="button" onClick={onClose} aria-label="Close processing details" className="absolute inset-0 bg-[#151827]/35 backdrop-blur-sm" />
-        <section role="dialog" aria-modal="true" aria-label="Technical evidence" className="relative z-10 w-full max-w-[640px] rounded-[28px] border border-white/80 bg-[#fbfcff] p-8 text-center shadow-[0_30px_80px_rgba(30,35,80,0.28)] dark:border-white/10 dark:bg-[#202437]">
-          <p className="type-overline text-[#7484e6]">Technical evidence</p>
-          <p className="type-section-title mt-2 text-[#171827] dark:text-white">No question results to show yet</p>
-          <p className="type-body mx-auto mt-3 max-w-[460px] text-slate-500 dark:text-slate-400">This student has no question-level grades recorded yet. Once evaluation produces marks, per-question detail and evidence will appear here.</p>
-          <button type="button" onClick={onClose} className="type-button mt-6 inline-flex items-center gap-1 rounded-full bg-[#171b32] px-5 py-2.5 text-white">Close</button>
-        </section>
-      </div>
-    );
+/** Real processing evidence: pipeline artifacts + grading telemetry. */
+function ArtifactGallery({ submissionId, kind, files, emptyTitle, emptyDescription }: { submissionId: string; kind: ProcessingImageKind; files: string[]; emptyTitle: string; emptyDescription: string }) {
+  const [urls, setUrls] = useState<Array<{ file: string; url: string }>>([]);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (files.length === 0) return;
+    let cancelled = false;
+    const created: Array<{ file: string; url: string }> = [];
+    (async () => {
+      for (const file of files) {
+        try {
+          const url = await fetchProcessingImageUrl(submissionId, kind, file);
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            continue;
+          }
+          created.push({ file, url });
+          setUrls([...created]);
+        } catch {
+          if (!cancelled) setFailed(true);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      for (const item of created) URL.revokeObjectURL(item.url);
+    };
+  }, [submissionId, kind, files]);
+  if (files.length === 0) {
+    return <EvidencePlaceholder icon={kind === "segments" ? Layers3 : FileText} title={emptyTitle} description={emptyDescription} />;
   }
-  const structured = { source: "frontend-demo", roll_number: student.rollNumber, class_id: resultClass.id, question: sampleQuestion.number, marks_awarded: sampleQuestion.marksAwarded, max_marks: sampleQuestion.maxMarks, strictness: sampleQuestion.strictness, status: student.status };
-  return <div className="fixed inset-0 z-50 flex items-center justify-center p-4"><button type="button" onClick={onClose} aria-label="Close processing details" className="absolute inset-0 bg-[#151827]/35 backdrop-blur-sm" /><section role="dialog" aria-modal="true" aria-label="Technical evidence" className="relative z-10 flex max-h-[calc(100dvh-32px)] w-full max-w-[920px] flex-col overflow-hidden rounded-[28px] border border-white/80 bg-[#fbfcff] shadow-[0_30px_80px_rgba(30,35,80,0.28)] dark:border-white/10 dark:bg-[#202437]"><div className="flex items-start justify-between gap-4 border-b border-[#edf0ff] p-5 dark:border-white/10 sm:p-7"><div><p className="type-overline text-[#7484e6]">Technical evidence</p><h2 className="type-page-title mt-2 text-[#171827] dark:text-white">Processing details</h2><p className="mt-2 text-[13px] font-medium text-slate-500 dark:text-slate-400">Optional frontend-only placeholders for a future document-processing pipeline.</p></div><button type="button" onClick={onClose} className="rounded-full border border-slate-200 bg-white p-2 text-slate-500 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#7788ff] dark:border-white/10 dark:bg-white/5 dark:text-slate-300"><X className="h-4 w-4" /></button></div><Tabs defaultValue="original" className="min-h-0 flex-1 p-5 sm:p-7"><TabsList className="max-w-full overflow-x-auto bg-[#eef0ff] dark:bg-white/[0.06]"><TabsTrigger value="original" className="text-[12px]">Original</TabsTrigger><TabsTrigger value="preprocessed" className="text-[12px]">Preprocessed</TabsTrigger><TabsTrigger value="segments" className="text-[12px]">Segments</TabsTrigger><TabsTrigger value="ocr" className="text-[12px]">OCR</TabsTrigger><TabsTrigger value="evaluation" className="text-[12px]">Evaluation Data</TabsTrigger></TabsList><TabsContent value="original" className="mt-5"><EvidencePlaceholder icon={FileText} title="Original answer sheet" description="No original PDF or document is connected in this frontend-only demonstration." /></TabsContent><TabsContent value="preprocessed" className="mt-5"><EvidencePlaceholder icon={ScanLine} title="Preprocessed document preview" description="Preprocessed page images will be shown here when the processing pipeline is connected." /></TabsContent><TabsContent value="segments" className="mt-5"><div className="rounded-[20px] border border-[#e0e5ff] bg-[#f8f9ff] p-5 dark:border-white/10 dark:bg-white/[0.04]"><p className="type-overline text-[#7484e6]">Page 1</p><div className="mt-4 grid gap-3 sm:grid-cols-3">{[1, 2, 3].map((segment) => <div key={segment} className="rounded-xl border border-dashed border-[#c9d2ff] bg-white/80 p-4 dark:border-white/10 dark:bg-white/[0.03]"><p className="text-[12px] font-semibold text-[#171827] dark:text-white">Segment {String(segment).padStart(2, "0")}</p><p className="mt-1 text-[12px] text-slate-500 dark:text-slate-400">Question {segment} crop placeholder</p></div>)}</div><p className="mt-4 text-[12px] font-medium text-slate-500 dark:text-slate-400">Bounding boxes and crop images will be supplied by a connected service.</p></div></TabsContent><TabsContent value="ocr" className="mt-5"><div className="rounded-[20px] border border-[#e0e5ff] bg-[#171b32] p-5 text-[#e9edff] shadow-[0_12px_28px_rgba(30,35,75,0.15)]"><p className="font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-[#aeb9ff]">OCR result · placeholder</p><pre className="mt-4 whitespace-pre-wrap font-mono text-[12px] leading-6 text-[#e9edff]">{`Q1. ${sampleQuestion.questionText}\n\n${sampleQuestion.studentAnswer}\n\nThis is mock technical evidence only. No OCR retrieval or extraction is connected.`}</pre></div></TabsContent><TabsContent value="evaluation" className="mt-5"><div className="flex items-center justify-between gap-3"><div><p className="text-[14px] font-semibold text-[#171827] dark:text-white">Evaluation data</p><p className="mt-1 text-[12px] text-slate-500 dark:text-slate-400">Structured frontend mock data prepared for a later result service.</p></div><button type="button" onClick={() => setRawData((value) => !value)} className="type-button rounded-full border border-[#dce2ff] bg-white px-3 py-2 text-[#5366d4] dark:border-white/10 dark:bg-white/[0.06] dark:text-[#b8c0ff]">{rawData ? "Formatted" : "Raw JSON"}</button></div>{rawData ? <pre className="mt-4 overflow-x-auto rounded-[18px] bg-[#171b32] p-4 font-mono text-[12px] leading-6 text-[#e9edff]">{JSON.stringify(structured, null, 2)}</pre> : <dl className="mt-4 grid gap-3 rounded-[20px] border border-[#e0e5ff] bg-[#f8f9ff] p-5 sm:grid-cols-2 dark:border-white/10 dark:bg-white/[0.04]">{Object.entries(structured).map(([key, value]) => <div key={key}><dt className="type-overline text-slate-400">{key.replaceAll("_", " ")}</dt><dd className="mt-1 text-[13px] font-semibold text-[#171827] dark:text-white">{String(value)}</dd></div>)}</dl>}</TabsContent></Tabs></section></div>;
+  return (
+    <div className="space-y-3">
+      {urls.map(({ file, url }) => (
+        <figure key={file} className="overflow-hidden rounded-[18px] border border-[#e4e8ff] bg-white shadow-sm dark:border-white/10 dark:bg-white/[0.04]">
+          <img src={url} alt={file} className="max-h-[540px] w-full bg-white object-contain" loading="lazy" />
+          <figcaption className="border-t border-[#eef0ff] px-3 py-2 font-mono text-[11px] text-slate-500 dark:border-white/10 dark:text-slate-400">{file}</figcaption>
+        </figure>
+      ))}
+      {urls.length < files.length && !failed && <p className="type-support text-slate-400">Loading artifacts…</p>}
+    </div>
+  );
+}
+
+
+function EvaluationEvidence({ questions }: { questions: Record<string, ProcessingQuestion> }) {
+  const entries = Object.entries(questions).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
+  if (entries.length === 0) {
+    return <EvidencePlaceholder icon={Braces} title="No grading data recorded" description="Grading telemetry appears here after the evaluation pipeline produces marks for this paper." />;
+  }
+  return (
+    <div className="space-y-2">
+      {entries.map(([qid, q]) => (
+        <article key={qid} className="rounded-[18px] border border-[#e4e8ff] bg-white p-4 shadow-sm dark:border-white/10 dark:bg-white/[0.04]">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-[13px] font-semibold text-[#171827] dark:text-white">{qid}</p>
+            <span className="rounded-full bg-[#eef0ff] px-2 py-0.5 text-[11px] font-semibold text-[#6374da]">{q.proposed_marks ?? "—"} / {q.maximum_marks ?? "—"} marks</span>
+            {q.risk_level && <span className="rounded-full bg-[#fff2df] px-2 py-0.5 text-[11px] font-medium text-[#b57626]">risk: {q.risk_level}</span>}
+            {q.teacher_decision && <span className="rounded-full bg-[#e8f7ef] px-2 py-0.5 text-[11px] font-medium text-[#4f8f70]">teacher: {q.teacher_decision.approved ? "approved" : "pending"}{q.teacher_decision.final_marks != null ? ` · ${q.teacher_decision.final_marks}` : ""}</span>}
+          </div>
+          {q.feedback && <p className="mt-2 text-[13px] leading-5 text-slate-600 dark:text-slate-300">{q.feedback}</p>}
+          {(q.reasons ?? []).length > 0 && <p className="mt-1 text-[12px] font-medium text-slate-500 dark:text-slate-400">Review reasons: {(q.reasons ?? []).join(" · ")}</p>}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+
+function TechnicalEvidenceDrawer({ open, student, onClose }: { open: boolean; student: StudentResult; onClose: () => void }) {
+  const [details, setDetails] = useState<ProcessingDetails | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setDetails(null);
+    setError(null);
+    getProcessingDetails(student.id)
+      .then((payload) => {
+        if (!cancelled) setDetails(payload);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : "Could not load processing details.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, student.id]);
+  if (!open) return null;
+  const artifacts = details?.artifacts;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <button type="button" onClick={onClose} aria-label="Close processing details" className="absolute inset-0 bg-[#151827]/35 backdrop-blur-sm" />
+      <section role="dialog" aria-modal="true" aria-label="Technical evidence" className="relative z-10 flex max-h-[calc(100dvh-32px)] w-full max-w-[920px] flex-col overflow-hidden rounded-[28px] border border-white/80 bg-[#fbfcff] shadow-[0_30px_80px_rgba(30,35,80,0.28)] dark:border-white/10 dark:bg-[#202437]">
+        <div className="flex items-start justify-between gap-4 border-b border-[#edf0ff] p-5 dark:border-white/10 sm:p-7">
+          <div>
+            <p className="type-overline text-[#7484e6]">Technical evidence</p>
+            <h2 className="type-page-title mt-2 text-[#171827] dark:text-white">Processing details</h2>
+            <p className="mt-2 text-[13px] font-medium text-slate-500 dark:text-slate-400">
+              {student.rollNumber}
+              {details?.job ? ` · job ${details.job.status ?? "unknown"} · stage ${details.job.current_stage ?? "—"}` : ""}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-full border border-slate-200 bg-white p-2 text-slate-500 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#7788ff] dark:border-white/10 dark:bg-white/5 dark:text-slate-300"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-5 sm:p-7">
+          {error ? (
+            <EvidencePlaceholder icon={AlertTriangle} title="Could not load processing details" description={error} />
+          ) : !details ? (
+            <p className="type-support text-slate-400">Loading processing details…</p>
+          ) : (
+            <Tabs defaultValue="original">
+              <TabsList className="max-w-full overflow-x-auto bg-[#eef0ff] dark:bg-white/[0.06]">
+                <TabsTrigger value="original" className="text-[12px]">Original</TabsTrigger>
+                <TabsTrigger value="preprocessed" className="text-[12px]">Preprocessed</TabsTrigger>
+                <TabsTrigger value="segments" className="text-[12px]">Segments</TabsTrigger>
+                <TabsTrigger value="ocr" className="text-[12px]">OCR</TabsTrigger>
+                <TabsTrigger value="evaluation" className="text-[12px]">Evaluation Data</TabsTrigger>
+              </TabsList>
+              <TabsContent value="original" className="mt-5">
+                <ArtifactGallery submissionId={student.id} kind="original" files={artifacts?.original ?? []} emptyTitle="Original page renders unavailable" emptyDescription="Rendered page images are written when the evaluation pipeline processes this PDF." />
+              </TabsContent>
+              <TabsContent value="preprocessed" className="mt-5">
+                <ArtifactGallery submissionId={student.id} kind="preprocessed" files={artifacts?.preprocessed ?? []} emptyTitle="Preprocessed pages unavailable" emptyDescription="Deskewed, contrast-normalised page images appear here after preprocessing runs." />
+              </TabsContent>
+              <TabsContent value="segments" className="mt-5">
+                <ArtifactGallery submissionId={student.id} kind="segments" files={artifacts?.segments ?? []} emptyTitle="No segment crops" emptyDescription="Per-question region crops written by the segmentation stage appear here." />
+              </TabsContent>
+              <TabsContent value="ocr" className="mt-5">
+                <OcrEvidence regions={details.regions ?? []} />
+              </TabsContent>
+              <TabsContent value="evaluation" className="mt-5">
+                <EvaluationEvidence questions={details.questions} />
+              </TabsContent>
+            </Tabs>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function OcrEvidence({ regions }: { regions: ProcessingRegion[] }) {
+  const withText = regions.filter((region) => (region.ocr?.raw_text ?? "").length > 0);
+  if (withText.length === 0) {
+    return <EvidencePlaceholder icon={ScanLine} title="No OCR text recorded yet" description="Per-region OCR transcription appears here once an evaluation job completes on this build — the worker now persists regions and OCR into the evidence tables." />;
+  }
+  return (
+    <div className="space-y-2">
+      {withText.map((region) => (
+        <article key={region.region_id} className="rounded-[18px] border border-[#e4e8ff] bg-white p-4 shadow-sm dark:border-white/10 dark:bg-white/[0.04]">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-[13px] font-semibold text-[#171827] dark:text-white">{region.question_id ?? "Unmapped region"}</p>
+            <span className="rounded-full bg-[#eef0ff] px-2 py-0.5 text-[11px] font-medium text-[#6374da]">P{region.page_number} · {region.region_type}</span>
+            {(region.ocr?.flags ?? []).map((flag) => <span key={flag} className="rounded-full bg-[#fff2df] px-2 py-0.5 text-[11px] font-medium text-[#b57626]">{flag}</span>)}
+            <span className="ml-auto text-[11px] text-slate-400">{region.ocr?.word_count ?? 0} words</span>
+          </div>
+          <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-xl bg-[#f7f8ff] p-3 font-mono text-[12px] leading-5 text-slate-700 dark:bg-white/[0.06] dark:text-slate-200">{region.ocr?.raw_text}</pre>
+          {(region.ocr?.uncertain_spans ?? []).length > 0 && (
+            <p className="mt-2 text-[12px] font-medium text-[#b57626]">Uncertain: {(region.ocr?.uncertain_spans ?? []).map((u) => String(u?.text ?? "")).filter(Boolean).join(", ")}</p>
+          )}
+        </article>
+      ))}
+    </div>
+  );
 }
 
 function EvidencePlaceholder({ icon: Icon, title, description }: { icon: typeof FileText; title: string; description: string }) { return <div className="flex min-h-[250px] flex-col items-center justify-center rounded-[20px] border border-dashed border-[#c9d2ff] bg-[linear-gradient(135deg,#f7f8ff,#eef1ff)] p-6 text-center dark:border-[#8797ff]/30 dark:bg-white/[0.04]"><span className="flex h-14 w-14 items-center justify-center rounded-2xl bg-white text-[#7182ef] shadow-sm dark:bg-white/10"><Icon className="h-6 w-6" /></span><p className="mt-4 text-[15px] font-semibold text-[#171827] dark:text-white">{title}</p><p className="mt-2 max-w-[420px] text-[13px] leading-5 text-slate-500 dark:text-slate-400">{description}</p></div>; }
 
 /** Map the read-model's per-question record into the Results domain shape. */
+/** The backend stores strictness per question; normalise any unknown value. */
+function normalizeStrictness(level: string | null | undefined): QuestionResult["strictness"] {
+  const value = String(level ?? "").toLowerCase();
+  if (value === "lenient" || value === "strict") return value;
+  return "moderate";
+}
+
 function detailToQuestionResults(detail: SubmissionResultDetail): QuestionResult[] {
   return (detail?.questions ?? []).map((question, index) => {
     const raw = String(question.question_id ?? "").replace(/^Q/i, "");
@@ -211,7 +385,7 @@ function detailToQuestionResults(detail: SubmissionResultDetail): QuestionResult
       questionText: "Evaluation record — question text is linked from the answer key.",
       marksAwarded: question.final_marks,
       maxMarks: question.maximum,
-      strictness: "moderate",
+      strictness: normalizeStrictness(question.strictness_level),
       studentAnswer: "",
       expectedPoints: [],
       evaluation: feedback || notes,

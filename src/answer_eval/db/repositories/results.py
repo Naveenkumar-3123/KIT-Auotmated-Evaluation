@@ -88,10 +88,22 @@ async def assessment_results(pool: asyncpg.Pool, assessment_id: str) -> dict[str
 async def submission_results(pool: asyncpg.Pool, submission_id: str) -> dict[str, Any]:
     uid = __import__("uuid").UUID(submission_id)
     sub = await pool.fetchrow(
-        "select id, roll_number, status from submissions where id = $1::uuid", uid
+        "select id, assessment_id, roll_number, status from submissions where id = $1::uuid", uid
     )
     if sub is None:
         return {}
+    strict_by_q: dict[str, str] = {}
+    if sub["assessment_id"]:
+        policy_rows = await pool.fetch(
+            """
+            select distinct on (question_number) question_number, strictness_level
+            from question_policies
+            where assessment_id = $1::uuid
+            order by question_number, version desc
+            """,
+            sub["assessment_id"],
+        )
+        strict_by_q = {f"Q{r['question_number']}": r["strictness_level"] for r in policy_rows}
     questions = await pool.fetch(
         """
         select question_id, marks_awarded, marks_maximum, source, breakdown,
@@ -122,10 +134,12 @@ async def submission_results(pool: asyncpg.Pool, submission_id: str) -> dict[str
                 "ai_proposed": float(ai["proposed_marks"]) if ai else None,
                 "criteria": ai["criteria"] if ai else [],
                 "breakdown": q["breakdown"],
+                "strictness_level": strict_by_q.get(q["question_id"]),
             }
         )
     return {
         "submission_id": str(sub["id"]),
+        "assessment_id": str(sub["assessment_id"]) if sub["assessment_id"] else None,
         "roll_number": sub["roll_number"],
         "status": sub["status"],
         "questions": out_questions,

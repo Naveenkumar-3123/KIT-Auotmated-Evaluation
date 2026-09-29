@@ -9,8 +9,6 @@ exhausted retries are retained in the durable store (dead-letter state).
 import os
 import threading
 import uuid
-import threading
-import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -314,6 +312,7 @@ class EvaluationWorker:
                 persist(job.submission_id, summary)
             except Exception:  # noqa: BLE001 - persistence must never break grading
                 logger.warning("persist_results failed", submission_id=job.submission_id, exc_info=True)
+        self._persist_perception(job, result)
         mark = getattr(self.store, "mark_submission", None)
         if callable(mark):
             try:
@@ -321,6 +320,41 @@ class EvaluationWorker:
             except Exception:  # noqa: BLE001
                 logger.warning("mark_submission failed", submission_id=job.submission_id)
         logger.info("Job completed", job_id=job.job_id, submission_id=job.submission_id)
+
+    def _persist_perception(self, job: JobRecord, final_state: dict) -> None:
+        """Persist pages/spans/regions/OCR for the Processing-Details evidence view.
+
+        Best-effort: runs after grading is durable and never raises.
+        """
+        if not isinstance(final_state, dict) or not (
+            final_state.get("page_records") or final_state.get("region_records")
+        ):
+            return
+        pool = getattr(self.store, "pool", None)
+        run_coro = getattr(self.store, "run_coro", None)
+        if pool is None or run_coro is None:
+            logger.warning(
+                "No DB loop/pool on job store; skipping perception persistence",
+                submission_id=job.submission_id,
+            )
+            return
+        try:
+            import os
+
+            from answer_eval.jobs.perception_persist import persist_perception
+            from answer_eval.storage import LocalStorageProvider
+
+            storage_root = os.getenv("STORAGE_LOCAL_ROOT", "data/storage")
+            storage = LocalStorageProvider(storage_root)
+            persist_perception(
+                job.submission_id, final_state, storage, run_coro=run_coro, pool=pool
+            )
+        except Exception:  # noqa: BLE001 - evidence must never break grading
+            logger.warning(
+                "persist_perception setup failed",
+                submission_id=job.submission_id,
+                exc_info=True,
+            )
 
     def _handle_failure(self, job: JobRecord, exc: Exception) -> None:
         retryable = is_retryable(exc) and not isinstance(exc, PermanentJobError)

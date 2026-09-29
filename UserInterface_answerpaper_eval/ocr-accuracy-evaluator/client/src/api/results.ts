@@ -85,6 +85,7 @@ export interface SubmissionQuestionResult {
   ai_proposed: number | null;
   criteria: Array<Record<string, unknown>>;
   breakdown?: Record<string, unknown> | null;
+  strictness_level?: string | null;
 }
 
 export interface SubmissionResultDetail {

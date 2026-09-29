@@ -10,6 +10,8 @@ export interface AnswerKeyMeta {
   source_format: string;
   parser_model?: string | null;
   schema_version?: string;
+  /** Live batch progress while status === "parsing" (big multi-page keys). */
+  progress?: { done: number; total: number } | null;
 }
 
 export interface AnswerKeyDiagram {
