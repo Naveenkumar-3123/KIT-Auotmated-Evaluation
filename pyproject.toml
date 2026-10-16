@@ -63,11 +63,11 @@ all = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/answer_eval"]
+packages = ["backend/answer_eval"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "."]
-testpaths = ["tests"]
+pythonpath = ["backend", "."]
+testpaths = ["backend/tests"]
 asyncio_mode = "auto"
 markers = [
     "gpu: tests requiring GPU",

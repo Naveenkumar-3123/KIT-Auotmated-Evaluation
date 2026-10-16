@@ -1,0 +1,38 @@
+# Runtime Profiles — Starting-point configurations for different hardware/model combos
+# These are NOT absolute. The RuntimePlanner uses them as initial candidates,
+# then validates via actual server startup + smoke test.
+
+profiles:
+
+  fast_local:
+    description: "Fast development on consumer GPU (e.g. RTX 3060 12GB)"
+    target_context: 8192
+    target_concurrency: 1
+    target_batch_size: 512
+    max_image_pixels: 1048576  # 1024x1024
+    kv_cache_dtype: "f16"  # Benchmark other options; f16 is safe default
+    prefer_full_gpu: true
+    safety_margin_gb: 1.5
+    gpu_layers_override: null  # null = auto-detect
+
+  hybrid_local:
+    description: "Large model with CPU/GPU split (e.g. RTX 4060 8GB + 64GB RAM)"
+    target_context: 4096
+    target_concurrency: 1
+    target_batch_size: 256
+    max_image_pixels: 786432  # 768x1024
+    kv_cache_dtype: "f16"  # May benchmark q8 for memory savings
+    prefer_full_gpu: false
+    safety_margin_gb: 1.5
+    gpu_layers_override: null
+
+  cloud_gpu:
+    description: "Remote vLLM server with high-memory GPU"
+    target_context: 32768
+    target_concurrency: 4
+    target_batch_size: 2048
+    max_image_pixels: 2073600  # 1920x1080
+    kv_cache_dtype: "bf16"
+    prefer_full_gpu: true
+    safety_margin_gb: 0
+    gpu_layers_override: null

@@ -1,0 +1,61 @@
+# Image Preprocessing Configuration
+# Each step can be enabled/disabled independently.
+# Aggressive processing is avoided to preserve handwriting.
+
+pipeline:
+  # Orientation: auto-detect and correct page orientation
+  orientation_correction:
+    enabled: true
+
+  # Deskew: correct slight rotation from scanning
+  deskew:
+    enabled: true
+    max_angle_degrees: 15.0  # Skip deskew if detected angle exceeds this
+
+  # Border removal: remove scanner-introduced dark borders
+  border_removal:
+    enabled: true
+    # Conservative: only remove very dark, uniform borders
+    darkness_threshold: 30  # 0-255, pixels below this considered "border"
+    min_border_fraction: 0.02  # Minimum fraction of image width/height to consider border
+
+  # Noise reduction: light Gaussian blur to reduce scanner noise
+  noise_reduction:
+    enabled: true
+    kernel_size: 3  # Small kernel to avoid destroying handwriting strokes
+    method: "gaussian"  # gaussian | median | bilateral
+
+  # Contrast adjustment: CLAHE for adaptive contrast
+  contrast_adjustment:
+    enabled: true
+    clip_limit: 2.0
+    tile_grid_size: [8, 8]
+
+  # Brightness normalization
+  brightness_normalization:
+    enabled: true
+    target_mean: 200  # Target brightness for white background pages
+
+  # Resolution normalization
+  resolution_normalization:
+    enabled: true
+    target_dpi: 300
+    min_dimension: 1024
+    max_dimension: 4096
+
+  # Grayscale conversion (optional — keep color by default)
+  grayscale:
+    enabled: false
+
+# Quality analysis thresholds
+quality:
+  blur_threshold: 100.0  # Laplacian variance below this = blurry
+  low_contrast_threshold: 30.0  # Std dev below this = low contrast
+  low_brightness_threshold: 80  # Mean below this = too dark
+  high_brightness_threshold: 240  # Mean above this = washed out
+
+# PDF rendering
+pdf_rendering:
+  default_dpi: 300
+  max_dpi: 600
+  output_format: "PNG"

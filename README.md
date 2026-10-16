@@ -1,14 +1,10 @@
-# EvalAI — Answer Sheet Evaluation System
+# EvalAI / KIT Automated Paper Evaluation System
 
 **Automated, teacher-verified grading of handwritten answer sheets.**
 
-EvalAI turns scanned handwritten answer sheets (PDFs) into verified, auditable marks. It reads a
-student's handwriting with a locally hosted vision-language model, maps each answer region to the
-correct question, grades it against a teacher's answer key, and proposes marks — **every mark is
-reviewed by the teacher before it becomes final.**
+EvalAI turns scanned handwritten answer sheets (PDFs) into verified, auditable marks. It reads a student's handwriting with multimodal AI (Google Gemini Cloud API by default, or optional local vision models), maps each answer region to the correct question, grades it against a teacher's answer key, and proposes marks — **every mark is reviewed by the teacher before it becomes final.**
 
-> **The AI proposes, deterministic code enforces policy, and the teacher decides.
-> Nothing is ever silently graded.**
+> **"The AI proposes, deterministic code enforces policy, and the teacher decides. Nothing is ever silently graded."**
 
 ---
 
@@ -22,20 +18,14 @@ reviewed by the teacher before it becomes final.**
 - [Getting Started](#getting-started)
 - [Configuration](#configuration)
 - [Running the Tests](#running-the-tests)
-- [Developer Test UI](#developer-test-ui)
-- [Known Limitations](#known-limitations)
-- [Further Reading](#further-reading)
 
 ---
 
 ## Why
 
-Grading handwritten answer sheets by hand is slow, inconsistent, and hard to audit. EvalAI is built
-around a simple premise: **AI grading is only trustworthy when it is verifiable.** So the system
-keeps a complete evidence trail — every page render, every region crop, every OCR transcription,
-and two independent grading passes that must not silently disagree.
+Grading handwritten answer sheets by hand is slow, inconsistent, and hard to audit. EvalAI is built around a simple premise: **AI grading is only trustworthy when it is verifiable.** The system keeps a complete evidence trail — every page render, every region crop, every OCR transcription, and two independent grading passes that must not silently disagree.
 
-Everything runs **fully locally** on a single PC. No student data leaves the machine.
+The project runs out-of-the-box using **Google Gemini Flash / Flash-Lite API**, requiring **zero local model downloads or dedicated GPU hardware**. An embedded SQLite fallback ensures the system works immediately even if a local PostgreSQL instance is offline.
 
 ---
 
@@ -43,254 +33,157 @@ Everything runs **fully locally** on a single PC. No student data leaves the mac
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| AI runtime | **Ollama** + **Qwen3-VL 4B** (vision-language) | Local handwriting understanding. No data leaves the machine. |
-| Orchestration | **LangGraph** | 12-stage pipeline as a stateful graph with durable checkpoints — a crash never loses progress. |
-| Backend API | **FastAPI** (Python ≥ 3.11) | Uploads, configuration, results, teacher review. |
-| Durable storage | **PostgreSQL** + local file storage | Jobs, results, review decisions, evidence. |
-| Queue / leases | PostgreSQL-backed job store (Redis optional) | Single-PC friendly; workers claim jobs with leases and heartbeats. |
-| Frontend | **React 19 + Vite + TypeScript** | Teacher workspace: Configure → Evaluation → Results. |
-| Auth | **Supabase JWT** | Teachers only see their own assessments (row-level checks on every endpoint). |
+| **AI Runtime** | **Google Gemini Multimodal API** (Cloud Default) | Low-latency handwriting perception, OCR transcription, mathematical step verification, and diagram grading. |
+| **Alternative AI** | **Qwen-VL / Ollama / Local Transformers** | Optional local GPU inference support for fully air-gapped environments. |
+| **Orchestration** | **LangGraph** | 12-stage pipeline as a stateful graph with durable checkpoints — a crash never loses progress. |
+| **Backend API** | **FastAPI** (Python ≥ 3.11) | Uploads, configuration, background job worker, evaluation results, and teacher review endpoints (`backend/`). |
+| **Durable Storage** | **PostgreSQL** + **SQLite Embedded Fallback** | Users, profiles, jobs, results, review decisions, and sandboxed content-addressed file storage. |
+| **Frontend** | **React 19 + Vite + TypeScript + Tailwind CSS** | Interactive teacher workspace: Configure → Evaluation → Results (`frontend/`). |
+| **Auth & Email** | **Native JWT + SMTP App Password** | Secure teacher registration, email verification, and JWT session management. |
 
 ---
-
 
 ## The Pipeline
 
-The pipeline is a LangGraph state machine with 12 stages. Each stage is idempotent (safe to re-run)
-and its output is checkpointed, so a restart resumes exactly where it stopped.
+The pipeline is a LangGraph state machine with 12 distinct stages. Each stage is idempotent and its output is checkpointed:
 
 ```
- 1. Validate        PDF exists, rubrics well-formed — bad input never reaches the AI.
+ 1. Validate        PDF exists, rubrics well-formed — invalid input never reaches the AI.
  2. Render PDF      Each page rendered to a high-resolution image.
- 3. Preprocess      Deskew, denoise, contrast (CLAHE), resolution-normalise.
+ 3. Preprocess      Deskew, denoise, contrast (CLAHE), resolution-normalization.
  4. Segment         Split each page into answer regions (whitespace/ink analysis).
- 5. Map questions   Attach each region to a question number (see below).
- 6. OCR             Verbatim transcription of every region.
- 7. Diagrams        Detect/extract student diagrams where present.
+ 5. Map questions   Attach each region to a question number via margin & semantic mapping.
+ 6. OCR             Verbatim handwriting transcription preserving original text.
+ 7. Diagrams        Detect and extract student diagrams where present.
  8. Reconstruct     Merge a question's regions/pages into one canonical answer.
  9. Rules engine    Deterministic penalties: word count, missing diagrams, mandatory terms.
-10. Evaluation      AI grades semantic correctness vs the answer key.
-11. Verification    A second, "blind" AI pass re-grades independently;
-                    disagreements between the two passes raise review flags.
-12. Risk & review   Risk engine decides: auto-approve, or hold for the teacher.
+10. Evaluation      AI grades semantic correctness vs the answer key criteria.
+11. Verification    A second, blind AI pass re-grades independently; disagreements raise review flags.
+12. Risk & review   Risk engine decides: auto-approve, or flag for instructor review.
 ```
 
-After the pipeline, marks land in the **teacher review panel** → teacher approves or overrides →
-results are finalised into the Results read-model.
-
-### Roles of the AI agents
-
-Each stage's AI behaviour is a versioned system prompt under
-`src/answer_eval/prompts/templates/<task>/base.txt`. Two conventions matter most:
-
-- **OCR agent — "transcribe, never interpret."** It copies text exactly as written and preserves
-  spelling mistakes. A "helpful" correction by the OCR would corrupt the grading evidence.
-- **Verification agent — blind re-grade.** It is explicitly told it has *not* seen the first
-  grader's marks and must evaluate from scratch. Two independent passes that disagree become a
-  review flag rather than a silent choice.
+After the pipeline completes, marks land in the **teacher review panel** → teacher approves or overrides → results are finalized.
 
 ---
 
-
 ## Question Mapping
 
-Students' scans rarely have machine-readable question numbers, so mapping uses a **three-layer
-cascade**. Each layer runs only if the previous one is inconclusive, and every fallback is flagged
-for teacher review:
+Students' handwritten scans feature mixed answer sequences, margin annotations, and multi-page calculations. Mapping uses a robust cascade:
 
-1. **Margin anchors** — ink scan of the left margin + OCR of that strip finds question numbers
-   written at the margin. Most reliable when present.
-2. **Header anchors** — when the margin yields nothing (typical for phone scans), the system OCRs
-   the top band of each answer block, where students usually re-write the number.
-3. **Semantic mapping (AI)** — as a last resort, the VLM matches each unmatched region's
-   transcription against the *unanswered* questions from the answer key. A paragraph about PCA is
-   matched to the PCA question. Always flagged → routed to review.
-
-A deterministic tail-assignment and a sequential fallback sit below these, and are flagged too.
+1. **Margin Scanning & Ruled Line Detection**: High-precision boundary alignment detecting printed question markers (e.g. `Q1`, `11(a)`) while filtering ruled answer sheet line numbering (`1..30`).
+2. **Header Anchor Resolution**: Identifies section titles (e.g., `Part A`, `Part B`, `Question 12`) across complex multi-page spreads.
+3. **Semantic Fallback**: Multimodal classification maps unlabelled regions based on topic context and mathematical formulas.
 
 ---
 
 ## Repository Layout
 
 ```
-src/answer_eval/
-├── workflow/        LangGraph pipeline definition and state
-├── agents/          OCR, diagram, reconstruction agents
-├── prompts/         Versioned system prompts (templates/<task>/base.txt)
-├── processing/      PDF rendering, image preprocessing, segmentation, mapping
-├── answerkey/       Answer-key parsing (LaTeX / MathML / multi-page)
-├── grading/         Rules, evaluation, blind verification, confidence, risk
-├── inference/       Provider abstraction (Ollama, vLLM)
-├── jobs/            Worker loop, Postgres job store, perception persistence
-├── api/routers/     FastAPI endpoints (assessments, answer_keys, reviews, ...)
-├── db/              Repositories and schema access
-└── storage/         Local file storage provider
+├── backend/
+│   ├── answer_eval/
+│   │   ├── api/routers/     FastAPI endpoints (assessments, answer_keys, reviews, auth)
+│   │   ├── core/            Workflow graphs and execution state
+│   │   ├── db/              Database pool, migrations, and SQLite fallback
+│   │   ├── grading/         Rules, evaluation, blind verification, and risk engine
+│   │   ├── inference/       Gemini multimodal API provider & local model adapters
+│   │   ├── jobs/            Background worker loop and queue management
+│   │   ├── processing/      PDF rendering, CLAHE preprocessing, segmentation, mapping
+│   │   └── prompts/         Versioned prompt templates for OCR, diagram, and grading
+│   ├── config/              settings.yaml, models.yaml, preprocessing.yaml
+│   └── tests/               Unit and integration test suites
+│
+├── frontend/
+│   ├── client/              React 19 + Vite workspace (Configure → Evaluation → Results)
+│   │   ├── src/pages/       Configure.tsx, Evaluation.tsx, Results.tsx, Auth.tsx
+│   │   └── src/components/  UI components and interactive viewers
+│   ├── package.json         Frontend package configuration
+│   └── vite.config.ts       Vite dev server and API proxy configuration
+│
+├── run_backend.py           FastAPI server launcher with automatic SQLite fallback
+├── run_project.py           Interactive launcher for running backend & frontend together
+├── pyproject.toml           Backend Python package configuration
+└── .env.example             Template environment variables
+```
 
-UserInterface_answerpaper_eval/ocr-accuracy-evaluator/
-└── client/          React + Vite teacher workspace
-
-config/              settings.yaml, models.yaml, preprocessing.yaml, runtime_profiles.yaml
+---
 
 ## Getting Started
 
 ### Prerequisites
 
-- Python **≥ 3.11**
-- **Node ≥ 20** with **pnpm** (`pnpm@10.4.1` is pinned via `packageManager`)
-- **PostgreSQL** — a local instance, or a Supabase project
-- **Ollama** with the vision model pulled:
-  ```bash
-  ollama pull qwen3-vl:4b
-  ```
+- **Python ≥ 3.11**
+- **Node.js ≥ 20** (`npm` or `pnpm`)
+- **Google Gemini API Key** (Get one from [Google AI Studio](https://aistudio.google.com/))
 
-### 1. Backend
+### 1. Backend Setup
 
 ```bash
-git clone https://github.com/blank157/intern.git
-cd intern
+# Clone the repository
+git clone https://github.com/Naveenkumar-3123/KIT-Auotmated-Evaluation.git
+cd KIT-Auotmated-Evaluation
 
+# Create and activate virtual environment
 python -m venv .venv
-# Windows:      .venv\Scripts\activate
-# macOS/Linux:  source .venv/bin/activate
+# On Windows:
+.venv\Scripts\activate
+# On Linux/macOS:
+source .venv/bin/activate
 
-pip install -e ".[api,workflow,dev]"
+# Install dependencies
+pip install -e "./backend[api,workflow,dev]"
 
-cp .env.example .env      # Windows:  copy .env.example .env
-# then edit .env and fill in Supabase / Postgres credentials
+# Configure environment variables
+cp .env.example .env
+# Edit .env and paste your GEMINI_API_KEY:
+# GEMINI_API_KEY=your_key_here
+
+# Start the Backend Server (runs on port 8400)
+python run_backend.py
 ```
 
-Apply the database schema:
+*Note: If PostgreSQL is not installed locally, the backend automatically uses the embedded SQLite database at `data/evalai.db`.*
+
+### 2. Frontend Setup
 
 ```bash
-python scripts/apply_migrations.py
+cd frontend
+
+# Install Node dependencies
+npm install
+
+# Start Vite dev server (runs on port 3000)
+npm run dev
 ```
 
-### 2. Frontend
+Visit **`http://localhost:3000`** in your browser. All API calls to `/api` are automatically proxied to the backend on `http://127.0.0.1:8400`.
 
-```bash
-cd UserInterface_answerpaper_eval/ocr-accuracy-evaluator
-pnpm install
-pnpm dev                             # http://localhost:3000
-```
-
-Set the public Supabase values in `UserInterface_answerpaper_eval/ocr-accuracy-evaluator/.env.local`
-(`VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`) before starting the dev server. That file is
-git-ignored — never commit real keys.
+---
 
 ## Configuration
 
-Configuration lives in two places.
+### `backend/config/settings.yaml`
+Controls the active AI provider, model profile, OCR settings, and runtime safety margins:
+```yaml
+ai_provider: "gemini"
+active_model_profile: "gemini_flash_lite_latest"
+```
 
-**`config/*.yaml`** — model profiles, preprocessing and runtime settings:
-
-| File | Contents |
-|---|---|
-| `settings.yaml` | OCR and pipeline settings, including the `ocr:` section |
-| `models.yaml` | Available vision models and their profiles |
-| `runtime_profiles.yaml` | Runtime/hardware profiles |
-| `preprocessing.yaml` | Deskew, CLAHE, border-cleanup parameters |
-
-**Environment (`.env`)** — copy `.env.example`. The keys that matter most:
-
-| Variable | Purpose |
-|---|---|
-| `SUPABASE_URL`, `SUPABASE_ANON_KEY` | Public project settings (`VITE_*` variants go to the frontend) |
-| `SUPABASE_SERVICE_ROLE_KEY` | **Backend only** — never expose to the browser |
-| `DATABASE_URL` | Direct Postgres connection (use port `6543` pooler for serverless) |
-| `API_HOST` / `API_PORT` | API bind address (default `127.0.0.1:8300`) |
-| `API_ALLOWED_ORIGINS` | Comma-separated CORS origins |
-| `WORKER_TOKEN` | Shared token workers use to register and claim jobs |
-| `AI_PROVIDER` / `OLLAMA_BASE_URL` | Inference backend (default `ollama` at `localhost:11434/v1`) |
-| `VISION_MODEL` | Vision model tag (default `qwen3-vl:4b`) |
-| `STORAGE_LOCAL_ROOT` | Local object storage root (default `data/storage`) |
-
-> `.env` and `.env.local` are git-ignored. Never commit real credentials.
+### Environment Variables (`.env`)
+- `GEMINI_API_KEY`: API key for Google Gemini Multimodal models.
+- `DATABASE_URL`: PostgreSQL connection URL (e.g. `postgresql://postgres:password@localhost:5432/evalai_db`).
+- `JWT_SECRET`: Secret token for teacher session authentication.
+- `API_PORT`: Backend port (default: `8400`).
 
 ---
 
 ## Running the Tests
 
 ```bash
-pytest                      # all tests
-pytest tests/unit           # unit tests only
-pytest -m "not slow"        # skip slow tests
+# Backend unit tests
+cd backend
+pytest tests/unit
+
+# Frontend type check
+cd ../frontend
+npm run check
 ```
-
-Pytest markers: `gpu`, `model`, `integration`, `slow`. Configuration lives in `pyproject.toml`
-(`pythonpath = ["src", "."]`), so no extra setup is needed.
-
-Linting and type checks:
-
-```bash
-ruff check .
-mypy src
-```
-
----
-
-## Developer Test UI
-
-A **Streamlit** interface for inspecting each perception stage on real answer-sheet PDFs — page
-renders, preprocessing, segmentation overlays, verbatim OCR beside the crop, diagrams, and
-multi-page reconstruction. It also computes **CER/WER** against hand-entered ground truth and can
-export golden fixtures for regression tests.
-
-```bash
-streamlit run tools/test_ui/app.py     # http://localhost:8501
-```
-
-It binds to `127.0.0.1`, has no auth or grading logic, and stores uploads under
-`temp/test_ui/<session_id>/`. See [`tools/test_ui/README.md`](tools/test_ui/README.md) for the
-full walkthrough.
-
----
-
-## Known Limitations
-
-Honest list of what is not production-hardened yet:
-
-- **Answer-key parsing on dense scans** — batch parsing is in place; a tolerant JSON-salvage layer
-  recovers complete question objects from truncated model output, but very dense pages still need
-  tuning.
-- **Handwriting OCR accuracy** — currently a 4B-parameter local model. An 8B upgrade path exists and
-  is benchmarked before switching.
-- **Single-PC scope** — designed and tested on one machine (RTX 3060 12 GB), not multi-tenant.
-- **Windows UTF-8 caveat** — the API worker needs `PYTHONUTF8=1` (see above).
-
----
-
-## Further Reading
-
-- [`proposal.md`](proposal.md) — project proposal and design rationale
-- [`docs/system-overview.md`](docs/system-overview.md) — end-to-end technical walkthrough
-- [`docs/PROJECT-CONTEXT.md`](docs/PROJECT-CONTEXT.md) — project context
-- [`tools/test_ui/README.md`](tools/test_ui/README.md) — developer test UI guide
-
----
-
-*Evaluation agents and their authoritative prompts live in `src/answer_eval/prompts/templates/`,
-the pipeline in `src/answer_eval/workflow/`, and the job/review system in `src/answer_eval/jobs/`
-and `src/answer_eval/api/`.*
-
-
-
-### 3. Run the API and worker
-
-> **⚠️ Windows:** launch the API worker with `PYTHONUTF8=1`. The default `cp1252` codec makes
-> `structlog` crash on non-ASCII rubric text with a `UnicodeEncodeError`.
-> ```powershell
-> $env:PYTHONUTF8 = "1"
-> ```
-
-The API listens on `API_PORT` (default `8300`). Workers register with the API using
-`WORKER_TOKEN`, claim jobs with leases, and heartbeat while processing.
-
----
-
-supabase/migrations/ Schema, job store, and RLS policies
-tools/test_ui/       Streamlit developer test UI (see below)
-scripts/             Operational + diagnostic scripts
-tests/unit/          Unit tests      tests/integration/  Integration tests
-```
-
----

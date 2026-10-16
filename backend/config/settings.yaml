@@ -1,0 +1,53 @@
+# AI Provider Configuration
+ai_provider: "gemini"
+
+# Active model profile (overridden by MODEL_PROFILE or VISION_MODEL env vars)
+active_model_profile: "gemini_flash_lite_latest"
+
+# Ollama OpenAI-compatible server defaults
+ollama:
+  base_url: "http://localhost:11434/v1"
+  model: "qwen3-vl:4b"
+  api_key: "ollama"
+  timeout_seconds: 180   # large handwritten crops need headroom; do not hang forever
+  max_retries: 2
+
+# OCR inference configuration (centralized — consumed by agents/ocr + OllamaProvider)
+# Env overrides: OLLAMA_OCR_MODEL / OLLAMA_OCR_NUM_CTX / OLLAMA_OCR_NUM_PREDICT /
+# OLLAMA_OCR_TEMPERATURE (see .env.example)
+ocr:
+  model: ""                 # '' = inherit ollama.model / VISION_MODEL
+  num_ctx: 16384            # context for vision+prompt+generation; Ollama's old ~4096 default
+                            # was too small for larger crops (image tokens ate the window)
+  thinking_enabled: false   # Qwen3 reasoning OFF: OCR is direct transcription, not reasoning
+  temperature: 0.0          # deterministic transcription
+  num_predict: 4096         # output token budget for handwriting transcription
+  max_attempts: 2           # controlled retry cap; both failing => status=failed
+  min_valid_chars: 2        # non-empty responses shorter than this are 'suspiciously_tiny'
+
+# Logging
+log_level: "INFO"
+log_inference_timing: true
+log_memory_snapshots: true
+
+# Safety
+vram_safety_margin_gb: 1.5
+max_oom_retries: 3
+oom_resolution_tiers: [1048576, 589824, 262144, 147456]  # 1024², 768², 512², 384²
+
+# Paths (relative to project root)
+models_dir: "models"
+prompts_dir: "answer_eval/prompts/templates"
+data_dir: "data"
+cache_dir: "cache"
+benchmarks_dir: "benchmarks"
+
+# Structured output
+structured_output:
+  max_repair_retries: 2
+  validate_json_schema: true
+
+# Cache
+cache:
+  enabled: true
+  backend: "filesystem"

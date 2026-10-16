@@ -1,8 +1,8 @@
 # AI Provider Configuration
-ai_provider: "ollama"
+ai_provider: "gemini"
 
 # Active model profile (overridden by MODEL_PROFILE or VISION_MODEL env vars)
-active_model_profile: "qwen3_vl_4b"
+active_model_profile: "gemini_flash_lite_latest"
 
 # Ollama OpenAI-compatible server defaults
 ollama:
@@ -37,7 +37,7 @@ oom_resolution_tiers: [1048576, 589824, 262144, 147456]  # 1024², 768², 512²,
 
 # Paths (relative to project root)
 models_dir: "models"
-prompts_dir: "src/answer_eval/prompts/templates"
+prompts_dir: "answer_eval/prompts/templates"
 data_dir: "data"
 cache_dir: "cache"
 benchmarks_dir: "benchmarks"

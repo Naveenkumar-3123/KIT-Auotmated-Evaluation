@@ -1,9 +1,0 @@
-﻿# NOTE: qwen3-vl:4b ships a minimal chat template with NO thinking toggle, and
-# Ollama (verified on 0.32.15) rejects `PARAMETER think false` with
-# "unknown parameter". Thinking is therefore disabled per-request in code:
-# OllamaProvider._build_native_payload() sends an assistant message pre-filled
-# with a closed empty <think></think> block, so generation resumes directly
-# with transcription content and zero reasoning tokens.
-#
-# This Modelfile is kept for reference only; creating a variant from it fails.
-FROM qwen3-vl:4b
