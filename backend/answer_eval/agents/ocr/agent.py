@@ -93,8 +93,9 @@ class OCRAgent:
         cache_dir = Path("data/ocr_cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
         safe_sub_id = getattr(region, "submission_id", None) or "default"
+        is_test_sub = str(safe_sub_id).startswith("SUB-")
         cache_file = cache_dir / f"{safe_sub_id}_{region.region_id}.json"
-        if cache_file.exists():
+        if not is_test_sub and cache_file.exists():
             try:
                 cached_data = json.loads(cache_file.read_text(encoding="utf-8"))
                 logger.info(
@@ -286,10 +287,11 @@ class OCRAgent:
                     "consider adaptive segmentation for this region.",
                 )
 
-            try:
-                cache_file.write_text(result.model_dump_json(), encoding="utf-8")
-            except Exception:
-                pass
+            if not is_test_sub:
+                try:
+                    cache_file.write_text(result.model_dump_json(), encoding="utf-8")
+                except Exception:
+                    pass
 
             return result
 

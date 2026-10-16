@@ -14,22 +14,29 @@ def create_inference_provider(model: ModelProfile | None = None) -> InferencePro
     """Instantiate appropriate InferenceProvider based on model profile or default settings."""
     env_provider = os.getenv("AI_PROVIDER", "gemini").lower()
 
-    if model is None:
-        return GeminiProvider()
+    if model is not None:
+        if model.provider_type == ProviderType.GEMINI:
+            return GeminiProvider()
+        elif model.provider_type == ProviderType.OLLAMA:
+            return OllamaProvider(
+                base_url=model.endpoint,
+                model_name=model.model_id if ":" in model.model_id else None,
+            )
+        elif model.provider_type == ProviderType.LLAMA_SERVER:
+            return LlamaServerProvider(base_url=model.endpoint)
+        elif model.provider_type == ProviderType.VLLM:
+            return VLLMProvider(base_url=model.endpoint or "http://localhost:8000/v1")
+        elif model.provider_type == ProviderType.LOCAL_TRANSFORMERS:
+            return GeminiProvider()
+        else:
+            return GeminiProvider()
 
-    if (
-        model.provider_type in (ProviderType.GEMINI, ProviderType.LOCAL_TRANSFORMERS)
-        or env_provider == "gemini"
-    ):
-        return GeminiProvider()
-    elif model.provider_type == ProviderType.OLLAMA:
-        return OllamaProvider(
-            base_url=model.endpoint,
-            model_name=model.model_id if ":" in model.model_id else None,
-        )
-    elif model.provider_type == ProviderType.LLAMA_SERVER:
-        return LlamaServerProvider(base_url=model.endpoint)
-    elif model.provider_type == ProviderType.VLLM:
-        return VLLMProvider(base_url=model.endpoint or "http://localhost:8000/v1")
+    if env_provider == "ollama":
+        return OllamaProvider()
+    elif env_provider == "llama_server":
+        return LlamaServerProvider()
+    elif env_provider == "vllm":
+        return VLLMProvider()
     else:
         return GeminiProvider()
+

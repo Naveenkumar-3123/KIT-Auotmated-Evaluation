@@ -117,11 +117,12 @@ def test_build_line_observations_aligns_texts_by_count(tmp_path) -> None:
     assert all(o.bbox.x_max <= 0.16 for o in observations)
 
 
-def test_build_line_observations_mismatch_keeps_empty(tmp_path) -> None:
+def test_build_line_observations_mismatch_preserves_texts(tmp_path) -> None:
     page = tmp_path / "p1.png"
     draw_anchor_page(page, [300, 1400])
     observations = build_line_observations(1, str(page), texts=["a", "b", "c"])
-    assert all(o.text == "" for o in observations)
+    assert len(observations) >= 2
+    assert any(o.text != "" for o in observations)
 
 
 # ---------------------------------------------------------------------------

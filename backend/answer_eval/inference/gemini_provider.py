@@ -58,7 +58,7 @@ class GeminiProvider(InferenceProvider):
             vision=True,
             structured_output=True,
             thinking=False,
-            max_context=1_000_000,
+            max_context=1048576,
             image_limit=50,
             tool_support=True,
             prefix_cache=True,

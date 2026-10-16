@@ -199,17 +199,21 @@ class EvaluationAgent(BaseGradingAgent):
 
         if isinstance(data, dict):
             concepts = {c.concept_id: c for c in rubric.expected_concepts}
-            existing_crit = {
-                c.get("criterion_id"): c for c in data.get("criteria", []) if isinstance(c, dict)
-            }
+            raw_criteria = data.get("criteria", [])
             final_criteria = []
+            seen_cids = set()
+            for c in raw_criteria:
+                if isinstance(c, dict):
+                    c_copy = dict(c)
+                    cid = c_copy.get("criterion_id")
+                    if cid in concepts:
+                        c_obj = concepts[cid]
+                        c_copy.setdefault("criterion", c_obj.description)
+                        c_copy.setdefault("maximum_marks", c_obj.maximum_marks)
+                    final_criteria.append(c_copy)
+                    seen_cids.add(cid)
             for cid, c_obj in concepts.items():
-                if cid in existing_crit:
-                    c_dict = existing_crit[cid]
-                    c_dict.setdefault("criterion", c_obj.description)
-                    c_dict.setdefault("maximum_marks", c_obj.maximum_marks)
-                    final_criteria.append(c_dict)
-                else:
+                if cid not in seen_cids:
                     final_criteria.append({
                         "criterion_id": cid,
                         "criterion": c_obj.description,

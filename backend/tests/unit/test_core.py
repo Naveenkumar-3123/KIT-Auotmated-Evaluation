@@ -67,6 +67,6 @@ def test_provenance_schema() -> None:
 
 def test_settings_loader(temp_workspace: Path) -> None:
     settings = load_settings()
-    assert settings.active_model_profile in ("qwen3_vl_8b_local", "qwen3_vl_4b", "qwen_vl_4b_q8", "qwen_vl_4b_q4")
+    assert settings.active_model_profile in ("qwen3_vl_8b_local", "qwen3_vl_4b", "qwen_vl_4b_q8", "qwen_vl_4b_q4", "gemini_flash_lite_latest")
     assert settings.vram_safety_margin_gb == 1.5
     assert len(settings.oom_resolution_tiers) >= 3

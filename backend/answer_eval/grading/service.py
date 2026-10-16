@@ -291,6 +291,9 @@ class GradingService:
                     diagram_context=diagram_context,
                 )
             except Exception as e:
+                err_str = str(e).lower()
+                if "transient" in err_str or "timeout" in err_str or "connection" in err_str:
+                    raise
                 try:
                     logger.error("Evaluator failed for question %s: %s", rubric.question_id, str(e)[:300])
                 except Exception:
@@ -308,6 +311,9 @@ class GradingService:
                     diagram_context=diagram_context,
                 )
             except Exception as e:
+                err_str = str(e).lower()
+                if "transient" in err_str or "timeout" in err_str or "connection" in err_str:
+                    raise
                 try:
                     logger.warning("Verifier failed for question %s: %s", rubric.question_id, str(e)[:300])
                 except Exception:
