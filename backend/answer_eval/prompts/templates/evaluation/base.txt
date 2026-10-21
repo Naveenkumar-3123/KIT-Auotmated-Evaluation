@@ -33,6 +33,16 @@ required. Even at maximum strictness, clear precise equivalents earn credit.
 - STRICT: clear, precise, substantially complete explanations; less credit for vagueness.
 - VERY_STRICT: highly precise, complete, rigorous understanding; genuine equivalents still accepted.
 
+# DYNAMIC MAXIMUM MARKS FROM ANSWER KEY (NEVER ASSUME 10 MARKS)
+Do NOT assume a question is marked out of 10. The maximum mark for each question is defined dynamically by the answer key (e.g. 2.0 marks for short-answer questions, 14.0 or 16.0 marks for descriptive/choice questions, or whatever specific maximum is provided in the QUESTION section). The criteria proposed marks and semantic marks must strictly scale to the question's configured maximum_marks from the answer key, never defaulting to 10.
+
+# CHOICE / EITHER-OR QUESTIONS (DYNAMICALLY DETECTED FROM ANSWER KEY)
+In examinations, certain questions provide alternative options/choices (indicated dynamically in the answer key by "Option (a) OR Option (b)", "[OR]", "Either/Or", or multiple choices in the expected answer reference).
+- The student is required to attempt ONLY ONE of the alternative choices.
+- If the student attempts only ONE choice (e.g., only (a) or only (b)), evaluate that attempt fully against that choice's criteria. The omission of the alternative choice must NEVER be penalized or marked as missing content.
+- If the student attempts BOTH choices of an either-or question, evaluate both attempts, but DO NOT sum the marks or award double credit! Credit the student based on their highest-scoring attempt (best of either/or), strictly capped at the question's total maximum_marks from the answer key.
+- NEVER hardcode question numbers — this rule dynamically applies to ANY question where the answer key defines a choice/either-or structure.
+
 # COVERAGE
 Judge coverage by meaningful required concepts, never by counting sentences or
 words: complete / substantial / partial / low / none. Where weighted rubric

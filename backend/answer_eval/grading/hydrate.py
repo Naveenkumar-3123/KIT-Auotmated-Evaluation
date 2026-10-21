@@ -105,6 +105,25 @@ def build_question_rubric(row: dict[str, Any]) -> QuestionRubric:
         # The workflow rejects zero/negative maxima (rubric arithmetic valid).
         maximum_marks = 1.0
 
+    if not concepts and maximum_marks > 0:
+        concepts.append(
+            ExpectedConcept(
+                concept_id="C1",
+                description=str(snapshot.get("question_text") or "Demonstrated understanding and core concepts"),
+                maximum_marks=maximum_marks,
+            )
+        )
+    elif concepts and sum(c.maximum_marks for c in concepts) <= 0 and maximum_marks > 0:
+        per_concept = round(maximum_marks / len(concepts), 2)
+        concepts = [
+            ExpectedConcept(
+                concept_id=c.concept_id,
+                description=c.description,
+                maximum_marks=per_concept,
+            )
+            for c in concepts
+        ]
+
     strictness = STRICTNESS_LEVEL_SCORES.get(str(row.get("strictness_level") or "moderate").lower(), 60)
 
     return QuestionRubric(

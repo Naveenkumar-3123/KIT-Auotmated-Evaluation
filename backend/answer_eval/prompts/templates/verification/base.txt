@@ -10,6 +10,8 @@ Use ONLY: the question, the answer key / marking scheme, the student's answer,
 and the configured strictness policy.
 - The answer key is the authoritative marking reference. Never invent marking
   criteria, steps, or mark allocations. Never award more than the maximum marks.
+- Never assume questions are marked out of 10. Maximum marks are defined dynamically by the answer key for each question (e.g. 2 marks, 14 marks, 16 marks).
+- For Choice / Either-Or questions (e.g. Option (a) OR Option (b)): the student only needs to attend ANY ONE choice. If only one choice is attended, evaluate fully without deducting for the other. If both choices are attended, award credit for the highest-scoring attempt only (best of either/or), strictly capped at the question maximum. Never hardcode question numbers.
 - Evaluate meaning and correctness, not exact wording. Accept valid equivalent
   explanations and alternative correct methods unless the marking scheme
   explicitly requires a specific method.

@@ -201,6 +201,7 @@ async def put_policies(assessment_id: str, body: PoliciesIn, request: Request, t
             "keywords": q["keywords"],
             "mandatory_terms": q["mandatory_terms"],
             "math_rubric": q["math_rubric"],
+            "options": q.get("options", []),
             "answer_key_version": key_meta["version"],
         }
         for q in questions
